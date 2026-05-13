@@ -10,7 +10,7 @@
 
 | 资源 | 链接 | 语言 | 说明 |
 |------|------|------|------|
-| Neural Networks: Zero to Hero | [课程主页](https://karpathy.ai/zero-to-hero.html) / [GitHub](https://github.com/karpathy/nn-zero-to-hero) | 英文 | 从零开始的完整系列，**强烈推荐** |
+| Neural Networks: Zero to Hero | [课程主页](https://karpathy.ai/zero-to-hero.html) / [GitHub](https://github.com/karpathy/nn-zero-to-hero) / [**📄 中文翻译页面**](./zero-to-hero-zh.html) | 英文（含中文译版） | 从零开始的完整系列，**强烈推荐** |
 | Ep1: micrograd | [YouTube](https://www.youtube.com/watch?v=VMj-3S1tku0) | 英文，需翻译 | 反向传播 & 自动微分（2.5h） |
 | Ep2: makemore Part 1 | [YouTube](https://www.youtube.com/watch?v=PaCmpygFfXo) | 英文，需翻译 | Bigram 字符级语言模型 |
 | Ep3: makemore Part 2 | [YouTube](https://www.youtube.com/watch?v=TCH_1BHY58I) | 英文，需翻译 | MLP 语言模型 |

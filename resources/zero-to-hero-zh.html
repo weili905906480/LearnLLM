@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>神经网络：从零到英雄 — Andrej Karpathy（中文翻译）</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                   "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      line-height: 1.75;
+    }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Header ── */
+    header {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 28px 0 24px;
+      text-align: center;
+    }
+    header h1 {
+      font-size: 2.2rem;
+      font-weight: 700;
+      color: #f0f6fc;
+      letter-spacing: -0.5px;
+    }
+    header .subtitle {
+      margin-top: 8px;
+      color: #8b949e;
+      font-size: 1rem;
+    }
+    header .source-note {
+      margin-top: 12px;
+      font-size: 0.82rem;
+      color: #6e7681;
+    }
+    header .source-note a { color: #6e7681; text-decoration: underline; }
+
+    /* ── Main layout ── */
+    main {
+      max-width: 860px;
+      margin: 48px auto;
+      padding: 0 24px 80px;
+    }
+
+    /* ── Intro block ── */
+    .intro {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 28px 32px;
+      margin-bottom: 40px;
+    }
+    .intro p { margin-top: 12px; color: #c9d1d9; font-size: 0.97rem; }
+    .intro .prereq {
+      margin-top: 18px;
+      padding: 12px 16px;
+      background: #1c2128;
+      border-left: 3px solid #3fb950;
+      border-radius: 4px;
+      font-size: 0.92rem;
+      color: #8b949e;
+    }
+    .intro .prereq strong { color: #3fb950; }
+
+    /* ── Section title ── */
+    .section-title {
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: #f0f6fc;
+      margin: 0 0 20px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #30363d;
+    }
+
+    /* ── Lecture cards ── */
+    .lectures { display: flex; flex-direction: column; gap: 20px; margin-bottom: 48px; }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 22px 26px;
+      transition: border-color .2s;
+    }
+    .card:hover { border-color: #58a6ff; }
+    .card-header {
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+    }
+    .ep-badge {
+      flex-shrink: 0;
+      background: #1f6feb;
+      color: #fff;
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 20px;
+      margin-top: 3px;
+      letter-spacing: .5px;
+    }
+    .card h2 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: #f0f6fc;
+      flex: 1;
+    }
+    .card .desc {
+      margin-top: 10px;
+      font-size: 0.9rem;
+      color: #8b949e;
+    }
+    .card .tags {
+      margin-top: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .tag {
+      background: #21262d;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      font-size: 0.75rem;
+      padding: 2px 9px;
+      border-radius: 20px;
+    }
+    .card .links {
+      margin-top: 14px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 14px;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 500;
+      border: 1px solid transparent;
+      transition: opacity .15s;
+    }
+    .btn:hover { opacity: .8; text-decoration: none; }
+    .btn-yt  { background: #da3633; color: #fff; border-color: #da3633; }
+    .btn-gh  { background: #21262d; color: #c9d1d9; border-color: #30363d; }
+    .btn-nb  { background: #1f6feb22; color: #58a6ff; border-color: #1f6feb55; }
+
+    /* ── Engines section ── */
+    .engines {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 14px;
+      margin-bottom: 48px;
+    }
+    .engine-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 16px 18px;
+    }
+    .engine-card h3 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #f0f6fc;
+      margin-bottom: 6px;
+    }
+    .engine-card p {
+      font-size: 0.82rem;
+      color: #8b949e;
+    }
+
+    /* ── Footer ── */
+    footer {
+      text-align: center;
+      padding: 28px;
+      font-size: 0.8rem;
+      color: #6e7681;
+      border-top: 1px solid #21262d;
+    }
+    footer a { color: #6e7681; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>神经网络：从零到英雄</h1>
+  <p class="subtitle">Andrej Karpathy 深度学习课程 — 中文翻译版</p>
+  <p class="source-note">
+    原文：<a href="https://karpathy.ai/zero-to-hero.html" target="_blank">karpathy.ai/zero-to-hero.html</a>
+    ｜ 代码仓库：<a href="https://github.com/karpathy/nn-zero-to-hero" target="_blank">github.com/karpathy/nn-zero-to-hero</a>
+    ｜ 本译文仅供学习参考，内容基于原课程改编整理
+  </p>
+</header>
+
+<main>
+
+  <!-- ── 课程简介 ── -->
+  <div class="intro">
+    <p>
+      这是 Andrej Karpathy 出品的神经网络课程，以代码为核心，从最基础的反向传播讲起，
+      一步步构建到现代深度神经网络（包括 GPT）。
+    </p>
+    <p>
+      在我看来，语言模型是学习深度学习的绝佳切入点——即便你最终的目标是计算机视觉等其他领域，
+      这里学到的绝大多数知识都可以直接迁移过去。
+    </p>
+    <p>
+      所有代码均在视频中现场编写，不依赖任何深度学习框架（除了 Part 2 起会用到 PyTorch），
+      代码逻辑尽可能精简，便于理解。
+    </p>
+    <div class="prereq">
+      <strong>前置要求：</strong>扎实的 Python 编程能力 + 入门级数学基础（如：导数、高斯分布）
+    </div>
+  </div>
+
+  <!-- ── 视频课程列表 ── -->
+  <p class="section-title">📹 视频课程</p>
+  <div class="lectures">
+
+    <!-- Ep1 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="ep-badge">EP 1</span>
+        <h2>micrograd：手写反向传播与神经网络库</h2>
+      </div>
+      <p class="desc">
+        我们从头实现一个微型自动微分引擎 <strong>micrograd</strong>，
+        理解反向传播（backpropagation）的完整工作原理，
+        并在此基础上搭建一个具备 PyTorch 风格 API 的小型神经网络库。
+        这是整个课程最核心的基础，一定要彻底弄懂。
+      </p>
+      <div class="tags">
+        <span class="tag">反向传播</span>
+        <span class="tag">自动微分</span>
+        <span class="tag">计算图 (DAG)</span>
+        <span class="tag">梯度下降</span>
+        <span class="tag">链式法则</span>
+      </div>
+      <div class="links">
+        <a class="btn btn-yt" href="https://www.youtube.com/watch?v=VMj-3S1tku0" target="_blank">▶ YouTube</a>
+        <a class="btn btn-gh" href="https://github.com/karpathy/micrograd" target="_blank">⬡ micrograd 仓库</a>
+        <a class="btn btn-nb" href="https://github.com/karpathy/nn-zero-to-hero/blob/master/lectures/micrograd/micrograd_lecture_first_half_roughly.ipynb" target="_blank">📓 Notebook</a>
+      </div>
+    </div>
+
+    <!-- Ep2 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="ep-badge">EP 2</span>
+        <h2>makemore Part 1：二元语言模型（Bigram）</h2>
+      </div>
+      <p class="desc">
+        开始构建 <strong>makemore</strong>——一个字符级自回归语言模型。
+        本集从最简单的 <strong>Bigram 模型</strong>出发：用计数统计建模，
+        引入"训练/验证集"划分、负对数似然损失等核心概念。
+        这是理解语言模型的第一步。
+      </p>
+      <div class="tags">
+        <span class="tag">语言模型</span>
+        <span class="tag">Bigram</span>
+        <span class="tag">负对数似然</span>
+        <span class="tag">字符级模型</span>
+        <span class="tag">概率分布</span>
+      </div>
+      <div class="links">
+        <a class="btn btn-yt" href="https://www.youtube.com/watch?v=PaCmpygFfXo" target="_blank">▶ YouTube</a>
+        <a class="btn btn-gh" href="https://github.com/karpathy/makemore" target="_blank">⬡ makemore 仓库</a>
+        <a class="btn btn-nb" href="https://github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part1_bigrams.ipynb" target="_blank">📓 Notebook</a>
+      </div>
+    </div>
+
+    <!-- Ep3 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="ep-badge">EP 3</span>
+        <h2>makemore Part 2：MLP 语言模型</h2>
+      </div>
+      <p class="desc">
+        基于 Bengio 等人 2003 年的经典论文，实现一个<strong>多层感知机（MLP）语言模型</strong>。
+        引入词嵌入（Embedding）的概念，理解 MLP 如何利用上下文预测下一个字符。
+        通过可视化嵌入空间加深对模型的直觉认识。
+      </p>
+      <div class="tags">
+        <span class="tag">MLP</span>
+        <span class="tag">Embedding 词嵌入</span>
+        <span class="tag">上下文窗口</span>
+        <span class="tag">tanh 激活</span>
+        <span class="tag">mini-batch SGD</span>
+      </div>
+      <div class="links">
+        <a class="btn btn-yt" href="https://www.youtube.com/watch?v=TCH_1BHY58I" target="_blank">▶ YouTube</a>
+        <a class="btn btn-nb" href="https://github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part2_mlp.ipynb" target="_blank">📓 Notebook</a>
+      </div>
+    </div>
+
+    <!-- Ep4 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="ep-badge">EP 4</span>
+        <h2>makemore Part 3：激活、梯度与 BatchNorm</h2>
+      </div>
+      <p class="desc">
+        深入神经网络训练的"内部机制"：激活值的分布、梯度的饱和与消失问题、
+        权重初始化的重要性，以及 <strong>Batch Normalization</strong> 的原理与实现。
+        这一集能帮你真正理解为什么深层网络难以训练，以及常用技巧背后的逻辑。
+      </p>
+      <div class="tags">
+        <span class="tag">BatchNorm</span>
+        <span class="tag">梯度消失</span>
+        <span class="tag">权重初始化</span>
+        <span class="tag">激活函数分布</span>
+        <span class="tag">Kaiming 初始化</span>
+      </div>
+      <div class="links">
+        <a class="btn btn-yt" href="https://www.youtube.com/watch?v=P6sfmUTpUmc" target="_blank">▶ YouTube</a>
+        <a class="btn btn-nb" href="https://github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part3_bn.ipynb" target="_blank">📓 Notebook</a>
+      </div>
+    </div>
+
+    <!-- Ep5 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="ep-badge">EP 5</span>
+        <h2>makemore Part 4：Becoming a Backprop Ninja</h2>
+      </div>
+      <p class="desc">
+        手动推导 BatchNorm 层和交叉熵损失的反向传播梯度，
+        不依赖 PyTorch autograd，直接写出每个操作的梯度公式。
+        这一集能大幅提升对反向传播的深层理解，被认为是整个系列最有挑战性的一集。
+      </p>
+      <div class="tags">
+        <span class="tag">手写梯度</span>
+        <span class="tag">反向传播推导</span>
+        <span class="tag">BatchNorm 梯度</span>
+        <span class="tag">交叉熵梯度</span>
+      </div>
+      <div class="links">
+        <a class="btn btn-yt" href="https://www.youtube.com/watch?v=q8SA3rM6ckI" target="_blank">▶ YouTube</a>
+        <a class="btn btn-nb" href="https://github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part4_backprop.ipynb" target="_blank">📓 Notebook</a>
+      </div>
+    </div>
+
+    <!-- Ep6 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="ep-badge">EP 6</span>
+        <h2>makemore Part 5：WaveNet 结构</h2>
+      </div>
+      <p class="desc">
+        将之前的 MLP 语言模型改造为类似 <strong>DeepMind WaveNet</strong> 的层次化卷积结构。
+        通过扩大上下文窗口、引入层次化融合，理解如何构建更深、
+        感受野更大的语言模型，为后续的 Transformer 打好基础。
+      </p>
+      <div class="tags">
+        <span class="tag">WaveNet</span>
+        <span class="tag">层次化模型</span>
+        <span class="tag">扩张卷积</span>
+        <span class="tag">感受野</span>
+      </div>
+      <div class="links">
+        <a class="btn btn-yt" href="https://www.youtube.com/watch?v=t3YJ5hKiMQ0" target="_blank">▶ YouTube</a>
+        <a class="btn btn-nb" href="https://github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part5_cnn1.ipynb" target="_blank">📓 Notebook</a>
+      </div>
+    </div>
+
+    <!-- Ep7 -->
+    <div class="card" style="border-color: #1f6feb;">
+      <div class="card-header">
+        <span class="ep-badge" style="background:#388bfd;">EP 7 ⭐ 核心</span>
+        <h2>从零构建 GPT（Let's build GPT）</h2>
+      </div>
+      <p class="desc">
+        <strong>整个课程最重要的一集。</strong> 从零开始手写一个完整的 GPT 模型，
+        实现 <strong>Transformer 架构</strong>中的全部核心组件：
+        自注意力（Self-Attention）、多头注意力（Multi-Head Attention）、
+        因果掩码（Causal Mask）、前馈网络（FFN）、残差连接、LayerNorm，
+        并在莎士比亚文本上完成训练与文本生成。
+        配合 "Attention Is All You Need" 论文食用，效果最佳。
+      </p>
+      <div class="tags">
+        <span class="tag">Transformer</span>
+        <span class="tag">Self-Attention</span>
+        <span class="tag">Multi-Head Attention</span>
+        <span class="tag">因果掩码</span>
+        <span class="tag">位置编码</span>
+        <span class="tag">残差连接</span>
+        <span class="tag">LayerNorm</span>
+        <span class="tag">GPT-2</span>
+      </div>
+      <div class="links">
+        <a class="btn btn-yt" href="https://www.youtube.com/watch?v=kCc8FmEb1nY" target="_blank">▶ YouTube（2h）</a>
+        <a class="btn btn-gh" href="https://github.com/karpathy/nanoGPT" target="_blank">⬡ nanoGPT</a>
+        <a class="btn btn-nb" href="https://github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part5_cnn1.ipynb" target="_blank">📓 Notebook</a>
+      </div>
+    </div>
+
+    <!-- Ep8 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="ep-badge">EP 8</span>
+        <h2>从零构建 GPT Tokenizer（minBPE）</h2>
+      </div>
+      <p class="desc">
+        深入讲解大语言模型中使用的 <strong>BPE（字节对编码）分词算法</strong>，
+        从零实现 <strong>minBPE</strong>——一个极简的分词器。
+        解释 GPT 系列所用的 tiktoken 分词器的工作原理，以及为何分词结果
+        会产生一些"奇怪"的行为（如不能正确处理数字、空格等）。
+      </p>
+      <div class="tags">
+        <span class="tag">BPE</span>
+        <span class="tag">Tokenizer</span>
+        <span class="tag">tiktoken</span>
+        <span class="tag">字节级编码</span>
+        <span class="tag">词表训练</span>
+      </div>
+      <div class="links">
+        <a class="btn btn-yt" href="https://www.youtube.com/watch?v=zduSFxRajkE" target="_blank">▶ YouTube</a>
+        <a class="btn btn-gh" href="https://github.com/karpathy/minbpe" target="_blank">⬡ minBPE 仓库</a>
+      </div>
+    </div>
+
+    <!-- Ep9 -->
+    <div class="card" style="border-color: #3fb950;">
+      <div class="card-header">
+        <span class="ep-badge" style="background:#2ea043;">EP 9 🚀</span>
+        <h2>GPT-2 复现：build-nanogpt</h2>
+      </div>
+      <p class="desc">
+        在前序课程基础上，完整复现 <strong>OpenAI GPT-2（124M）</strong>，
+        在 <strong>OpenWebText</strong> 数据集上从头训练，
+        实现与原始 GPT-2 论文相当的性能指标。
+        涵盖 Flash Attention、混合精度训练（bf16）、分布式训练（DDP）等工程实践。
+        这是连接 nanoGPT 到 nanochat 的关键桥梁。
+      </p>
+      <div class="tags">
+        <span class="tag">GPT-2 复现</span>
+        <span class="tag">Flash Attention</span>
+        <span class="tag">混合精度 bf16</span>
+        <span class="tag">DDP 分布式训练</span>
+        <span class="tag">Gradient Accumulation</span>
+        <span class="tag">AdamW</span>
+        <span class="tag">Cosine LR Schedule</span>
+      </div>
+      <div class="links">
+        <a class="btn btn-yt" href="https://www.youtube.com/watch?v=l8pRSuU81PU" target="_blank">▶ YouTube（4h）</a>
+        <a class="btn btn-gh" href="https://github.com/karpathy/build-nanogpt" target="_blank">⬡ build-nanogpt</a>
+      </div>
+    </div>
+
+  </div><!-- /lectures -->
+
+  <!-- ── 四个核心引擎 ── -->
+  <p class="section-title">🔧 课程构建的四个核心引擎</p>
+  <div class="engines">
+    <div class="engine-card">
+      <h3>micrograd</h3>
+      <p>微型自动微分引擎，实现标量级反向传播，理解 autograd 的本质</p>
+    </div>
+    <div class="engine-card">
+      <h3>makemore</h3>
+      <p>字符级自回归语言模型，从 Bigram 到 MLP 再到 Transformer</p>
+    </div>
+    <div class="engine-card">
+      <h3>nanoGPT</h3>
+      <p>最简 GPT 实现，可复现 GPT-2，约 300 行核心代码</p>
+    </div>
+    <div class="engine-card">
+      <h3>minBPE</h3>
+      <p>最小 BPE 分词器实现，理解 GPT 系列 tokenizer 工作原理</p>
+    </div>
+  </div>
+
+  <!-- ── 推荐学习路径 ── -->
+  <p class="section-title">🗺️ 推荐学习路径</p>
+  <div class="intro">
+    <p>按以下顺序学习效果最佳：</p>
+    <p style="margin-top:14px; font-size:0.9rem; color:#8b949e; line-height:2.2;">
+      <strong style="color:#f0f6fc;">1.</strong> EP1 micrograd（理解反向传播）→
+      <strong style="color:#f0f6fc;">2.</strong> EP2-3 makemore（语言模型基础）→
+      <strong style="color:#f0f6fc;">3.</strong> EP4-5 BatchNorm/反向传播推导（进阶）→
+      <strong style="color:#f0f6fc;">4.</strong> EP7 Let's build GPT ⭐（核心！）→
+      <strong style="color:#f0f6fc;">5.</strong> EP8 Tokenizer →
+      <strong style="color:#f0f6fc;">6.</strong> EP9 GPT-2 复现 →
+      <strong style="color:#f0f6fc;">7.</strong> 继续学习 <a href="https://github.com/karpathy/nanochat">nanochat</a>
+    </p>
+    <p style="margin-top:14px; font-size:0.85rem; color:#6e7681;">
+      💡 EP6 WaveNet 可以跳过，EP4-5 可以先略读留到二刷时深入。
+    </p>
+  </div>
+
+  <!-- ── 相关链接 ── -->
+  <p class="section-title">🔗 相关链接</p>
+  <div class="intro">
+    <p style="font-size:0.9rem; line-height:2.2; color:#8b949e;">
+      📌 <a href="https://karpathy.ai/zero-to-hero.html" target="_blank">原课程页面</a>
+      ｜ 📦 <a href="https://github.com/karpathy/nn-zero-to-hero" target="_blank">课程代码 GitHub</a>
+      ｜ 🔵 <a href="https://www.youtube.com/@AndrejKarpathy" target="_blank">Karpathy YouTube 频道</a><br/>
+      🇨🇳 <a href="https://space.bilibili.com/1567748478" target="_blank">李沐 动手学深度学习（Bilibili）</a>（中文前置推荐）
+      ｜ 🇨🇳 <a href="https://zh.d2l.ai/" target="_blank">动手学深度学习 中文版</a>
+    </p>
+  </div>
+
+</main>
+
+<footer>
+  <p>
+    本页面为 <a href="https://karpathy.ai/zero-to-hero.html" target="_blank">karpathy.ai/zero-to-hero.html</a> 的中文翻译整理版，仅供学习参考。
+    原作者：Andrej Karpathy。内容已根据中文学习习惯重新组织，非逐字翻译。
+  </p>
+  <p style="margin-top:6px;">保存于 <a href="https://github.com/weili905906480/LearnLLM" target="_blank">LearnLLM</a> 学习仓库</p>
+</footer>
+
+</body>
+</html>
