@@ -840,26 +840,45 @@ def _init_weights(self, module):
 
 ```python
 def forward(self, idx, targets=None):
+    """
+    前向传播：token id 序列 → logits + loss
+    
+    参数:
+        idx:     (batch, seq_len) 输入 token id
+        targets: (batch, seq_len) 目标 token id（训练时提供，推理时为 None）
+    返回:
+        logits:  (batch, seq_len, vocab_size) 每个位置对所有词的预测分数
+        loss:    标量，交叉熵损失（推理时为 None）
+    """
     device = idx.device
-    b, t = idx.size()
-    assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-    pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+    b, t = idx.size()                    # b=批大小, t=序列长度
+    assert t <= self.config.block_size   # 序列不能超过上下文窗口(1024)
+    pos = torch.arange(0, t, dtype=torch.long, device=device)  # 位置索引 [0,1,...,t-1]
 
-    # forward the GPT model itself
-    tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-    pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-    x = self.transformer.drop(tok_emb + pos_emb)
+    # ═══ 嵌入：把整数 id 变成连续向量 ═══
+    tok_emb = self.transformer.wte(idx)  # 查词嵌入表: (b,t) → (b,t,768)
+    pos_emb = self.transformer.wpe(pos)  # 查位置嵌入表: (t,) → (t,768)
+    x = self.transformer.drop(tok_emb + pos_emb)  # 语义+位置 相加，再 Dropout
+
+    # ═══ 核心：12 层 Transformer Block 逐层处理 ═══
     for block in self.transformer.h:
-        x = block(x)
-    x = self.transformer.ln_f(x)
+        x = block(x)                     # 每层: Attention + MLP, 形状不变 (b,t,768)
 
+    # ═══ 最终归一化 ═══
+    x = self.transformer.ln_f(x)         # LayerNorm 稳定数值
+
+    # ═══ 输出头：768 维向量 → 50304 个词的分数 ═══
     if targets is not None:
-        # if we are given some desired targets also calculate the loss
-        logits = self.lm_head(x)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        # 训练模式：所有位置都算 loss
+        logits = self.lm_head(x)         # (b,t,768) → (b,t,50304)
+        loss = F.cross_entropy(          # 交叉熵：预测分布 vs 正确答案
+            logits.view(-1, logits.size(-1)),  # 展平为 (b*t, 50304)
+            targets.view(-1),                   # 展平为 (b*t,)
+            ignore_index=-1                     # 跳过 padding 位置
+        )
     else:
-        # inference-time mini-optimization: only forward the lm_head on the very last position
-        logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+        # 推理模式：只算最后一个位置（省 1024 倍计算）
+        logits = self.lm_head(x[:, [-1], :])   # (b,1,768) → (b,1,50304)
         loss = None
 
     return logits, loss
