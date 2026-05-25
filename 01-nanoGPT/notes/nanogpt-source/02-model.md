@@ -1,315 +1,997 @@
-# nanoGPT model.py 前向传播解析
+# model.py 逐行深度解析
 
-> 源码：https://github.com/karpathy/nanoGPT/blob/master/model.py
-> 约 300 行，实现完整 GPT 架构
+> nanoGPT 的灵魂文件：**~300 行实现完整 GPT 模型**
+>
+> 参考：
+> - [OpenAI GPT-2 官方实现](https://github.com/openai/gpt-2/blob/master/src/model.py)
+> - [HuggingFace GPT-2 PyTorch 实现](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py)
 
 ---
 
-## 类结构总览
+## 文件总览
+
+```python
+model.py 包含 6 个类：
+
+1. LayerNorm           — 自定义 LayerNorm（支持关闭 bias）
+2. CausalSelfAttention — 因果自注意力（核心中的核心）
+3. MLP                 — 前馈网络（升维 → 激活 → 降维）
+4. Block               — 一个 Transformer 层 = Attention + MLP
+5. GPTConfig           — 配置数据类
+6. GPT                 — 主模型类（组装一切）
+```
+
+它们之间的组合关系：
 
 ```
 GPT
- └── Block × N
-      ├── CausalSelfAttention   注意力子层
-      └── MLP                   前馈子层
+├── transformer (ModuleDict)
+│   ├── wte: Embedding (token)
+│   ├── wpe: Embedding (position)
+│   ├── drop: Dropout
+│   ├── h: ModuleList of Block × n_layer
+│   │   └── Block
+│   │       ├── ln_1: LayerNorm
+│   │       ├── attn: CausalSelfAttention
+│   │       ├── ln_2: LayerNorm
+│   │       └── mlp: MLP
+│   └── ln_f: LayerNorm (final)
+└── lm_head: Linear (输出层，与 wte 共享权重)
 ```
 
-## 数据流总览
 
-```
-输入 token ids: [B, T]
-        ↓ Token Embedding + Position Embedding
-[B, T, C]   C = n_embd = 768
-        ↓ × N 个 Block
-[B, T, C]
-        ↓ LayerNorm (最终)
-[B, T, C]
-        ↓ lm_head (Linear)
-[B, T, vocab_size]  ← logits
-        ↓ cross_entropy
-  scalar loss
-```
-
-- `B` = batch_size
-- `T` = sequence length（最大 1024）
-- `C` = n_embd（GPT-2 Small = 768）
 
 ---
 
-## 1. GPTConfig
+## 一、依赖导入
 
 ```python
-@dataclass
-class GPTConfig:
-    block_size: int = 1024    # 最大序列长度
-    vocab_size: int = 50304   # 词表大小（50257 向上补到 64 的倍数）
-    n_layer:    int = 12      # Transformer Block 层数
-    n_head:     int = 12      # 注意力头数
-    n_embd:     int = 768     # 嵌入维度
-    dropout:  float = 0.0
-    bias:      bool = True
+import math                    # sqrt, cos 等数学函数
+import inspect                 # 检查函数签名（用于判断 fused AdamW 是否可用）
+from dataclasses import dataclass  # 数据类装饰器
+
+import torch
+import torch.nn as nn          # 神经网络模块（Linear, Embedding, Dropout...）
+from torch.nn import functional as F  # 函数式 API（softmax, cross_entropy...）
 ```
+
+**设计选择**：只用 PyTorch 标准库，不依赖任何第三方模型库。
 
 ---
 
-## 2. CausalSelfAttention（因果自注意力）
+## 二、LayerNorm — 自定义层归一化
 
-### 初始化
+### 源码
 
 ```python
-self.c_attn = nn.Linear(n_embd, 3 * n_embd)   # Q/K/V 合并计算
-self.c_proj = nn.Linear(n_embd, n_embd)        # 输出投影
+class LayerNorm(nn.Module):
+    """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False"""
 
-# 因果掩码（下三角矩阵）
-self.register_buffer("bias",
-    torch.tril(torch.ones(block_size, block_size))
-          .view(1, 1, block_size, block_size))
+    def __init__(self, ndim, bias):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))      # γ 缩放参数，初始化为 1
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None  # β 偏移，可选
+
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 ```
 
-### 前向传播
+### 数学公式
+
+```
+对每个 token 的嵌入向量 x = [x₁, x₂, ..., x_d]：
+
+1. 计算均值：μ = (1/d) Σ xᵢ
+2. 计算方差：σ² = (1/d) Σ (xᵢ - μ)²
+3. 归一化：  x̂ᵢ = (xᵢ - μ) / √(σ² + ε)      ← ε=1e-5 防止除零
+4. 仿射变换：yᵢ = γᵢ · x̂ᵢ + βᵢ              ← γ=weight, β=bias（可学习）
+```
+
+### 为什么自己写？
+
+PyTorch 原生 `nn.LayerNorm` 不支持 `bias=False`（至少在写 nanoGPT 时）。
+现代研究发现去掉 bias 稍好一些（RMSNorm 干脆连 mean 都不减），所以需要这个自定义版本。
+
+### 形态变化
+
+```
+输入:  (B, T, n_embd)     如 (8, 1024, 768)
+输出:  (B, T, n_embd)     形状不变，只是每个向量被归一化了
+
+weight: (n_embd,)          如 (768,)
+bias:   (n_embd,) or None
+```
+
+### 直觉
+
+```
+归一化前：有的维度值很大(100)，有的很小(0.001)
+          → 梯度在不同维度差异巨大，训练不稳定
+
+归一化后：所有维度拉到统一尺度（~N(0,1)）
+          → 梯度更均匀，训练更稳定
+```
+
+
+
+---
+
+## 三、CausalSelfAttention — 因果自注意力
+
+### 这是什么？
+
+注意力机制让模型在生成每个 token 时，能"回头看"前面所有 token，并决定哪些更重要。
+
+**"Causal"**（因果）意味着：位置 i 只能看到 ≤i 的 token，不能偷看未来。
+
+### 源码 — __init__
+
+```python
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+
+        # 一个 Linear 同时计算 Q, K, V（高效：只做一次矩阵乘法）
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # 输出投影
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # 正则化
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+        # Flash Attention 检测
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            # 手动创建因果 mask（下三角矩阵）
+            self.register_buffer("bias",
+                torch.tril(torch.ones(config.block_size, config.block_size))
+                     .view(1, 1, config.block_size, config.block_size))
+```
+
+### 参数形态
+
+```
+c_attn:  Linear(n_embd, 3 * n_embd)
+         权重形状: (3*768, 768) = (2304, 768)
+         一次前向把 x 投影成 Q, K, V 三份
+
+c_proj:  Linear(n_embd, n_embd)
+         权重形状: (768, 768)
+         把多头拼接结果投影回原始维度
+```
+
+### 源码 — forward（核心）
 
 ```python
 def forward(self, x):
-    B, T, C = x.size()
+    B, T, C = x.size()  # batch, seq_len, n_embd
 
-    # Step 1: 计算 Q、K、V（一次线性变换，效率高）
+    # ═══════════════════════════════════════════════════════
+    # Step 1: 计算 Q, K, V
+    # ═══════════════════════════════════════════════════════
     q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-    # q, k, v: [B, T, C]
+    # x:        (B, T, C)
+    # c_attn(x):(B, T, 3C)  → split → q,k,v 各 (B, T, C)
 
-    # Step 2: 拆分多头
-    hs = C // self.n_head                              # head_size = 768/12 = 64
-    k = k.view(B, T, self.n_head, hs).transpose(1, 2) # [B, nh, T, hs]
-    q = q.view(B, T, self.n_head, hs).transpose(1, 2)
-    v = v.view(B, T, self.n_head, hs).transpose(1, 2)
+    # ═══════════════════════════════════════════════════════
+    # Step 2: 多头 reshape
+    # ═══════════════════════════════════════════════════════
+    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+    q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+    v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+    # 变换过程：
+    # (B, T, C) → (B, T, n_head, head_dim) → (B, n_head, T, head_dim)
+    # 例: (8, 1024, 768) → (8, 1024, 12, 64) → (8, 12, 1024, 64)
 
-    # Step 3: 计算注意力
+    # ═══════════════════════════════════════════════════════
+    # Step 3: 注意力计算
+    # ═══════════════════════════════════════════════════════
     if self.flash:
-        # Flash Attention（PyTorch 2.0+，内存高效）
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # PyTorch 2.0+ Flash Attention（高效 CUDA 内核）
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout if self.training else 0,
+            is_causal=True
+        )
     else:
-        # 标准注意力（手动实现）
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hs))
+        # 手动实现（教学版，更清晰）
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # (B,nh,T,hs) @ (B,nh,hs,T) → (B,nh,T,T)  注意力分数矩阵
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # 因果 mask：上三角填 -inf → softmax 后变 0
         att = F.softmax(att, dim=-1)
-        y = att @ v    # [B, nh, T, hs]
+        att = self.attn_dropout(att)
+        y = att @ v  # (B,nh,T,T) @ (B,nh,T,hs) → (B,nh,T,hs)
 
-    # Step 4: 合并多头
-    y = y.transpose(1, 2).contiguous().view(B, T, C)  # [B, T, C]
-
-    # Step 5: 输出投影
-    y = self.c_proj(y)
+    # ═══════════════════════════════════════════════════════
+    # Step 4: 多头合并 + 输出投影
+    # ═══════════════════════════════════════════════════════
+    y = y.transpose(1, 2).contiguous().view(B, T, C)
+    # (B,nh,T,hs) → (B,T,nh,hs) → (B,T,C)  把所有头拼起来
+    y = self.resid_dropout(self.c_proj(y))
     return y
 ```
 
-### 注意力计算可视化
+### 注意力计算的数学
 
 ```
-x: [B, T, C]
-  ↓ c_attn (Linear C→3C)
-split → Q[B,T,C]  K[B,T,C]  V[B,T,C]
-  ↓ reshape + transpose
-Q,K,V: [B, n_head=12, T, head_size=64]
+Attention(Q, K, V) = softmax(Q·K^T / √d_k) · V
 
-att = Q @ K^T / sqrt(64)    [B, 12, T, T]
-  ↓ masked_fill（未来位置 → -inf）
-  ↓ softmax（每行归一化为概率）
-y = att @ V                 [B, 12, T, 64]
-  ↓ transpose + reshape
-[B, T, 768]
-  ↓ c_proj
-[B, T, 768]
+其中：
+  Q: 查询（"我在找什么？"）
+  K: 键  （"我有什么内容？"）
+  V: 值  （"我的实际信息"）
+  d_k = head_dim = n_embd / n_head = 768/12 = 64
+
+缩放因子 √d_k：
+  防止点积值过大（d_k=64时，点积可能到几十甚至上百）
+  → softmax 饱和 → 梯度消失
+  除以 √64=8 后，值保持在合理范围
 ```
 
-### 为什么除以 sqrt(head_size)？
+### 多头注意力图解
 
 ```
-不除：Q@K^T 量级 ≈ head_size = 64
-     softmax 极端饱和 → 梯度消失
+n_embd = 768, n_head = 12, head_dim = 64
 
-除以 sqrt(64)=8：值归一化到合理量级
+输入 x: (B, T, 768)
+         ↓ c_attn (一个 Linear)
+      (B, T, 2304)
+         ↓ split 成 3 份
+  Q(B,T,768)  K(B,T,768)  V(B,T,768)
+         ↓ view + transpose
+  Q(B,12,T,64) K(B,12,T,64) V(B,12,T,64)
+         ↓ 12 个头独立计算注意力
+  out(B,12,T,64)
+         ↓ transpose + view（拼接）
+      (B, T, 768)
+         ↓ c_proj
+      (B, T, 768)
+
+每个头只看 64 维的子空间 → 学到不同的"注意力模式"
+12 个头并行 → 同时关注语法、语义、位置关系等
 ```
 
-### 因果掩码
+### 因果 Mask 可视化
 
 ```
-位置 i 只能看到 0 ~ i 的 token：
+对于 T=5 的序列：
 
-[[1, 0, 0, 0, 0],
- [1, 1, 0, 0, 0],
- [1, 1, 1, 0, 0],
- [1, 1, 1, 1, 0],
- [1, 1, 1, 1, 1]]
+     t=0  t=1  t=2  t=3  t=4
+t=0 [ 1    0    0    0    0  ]   ← 第0个token只能看自己
+t=1 [ 1    1    0    0    0  ]   ← 第1个能看 0,1
+t=2 [ 1    1    1    0    0  ]   ← 第2个能看 0,1,2
+t=3 [ 1    1    1    1    0  ]
+t=4 [ 1    1    1    1    1  ]   ← 最后一个能看所有
 
-0 的位置填 -inf → softmax 后概率为 0
+0 的位置填 -inf → softmax 后变 0 → 看不到未来
 ```
+
+### Flash Attention vs 手动实现
+
+```
+手动实现：
+  1. 计算完整 T×T 注意力矩阵 → 占 O(T²) 显存
+  2. 存储 softmax 输出 → 再乘 V
+  显存: O(T²)，T=1024 时 = 1M 个 float
+
+Flash Attention：
+  1. 分块计算（tiling），不完整存储注意力矩阵
+  2. 利用 GPU SRAM（快但小）替代 HBM（慢但大）
+  显存: O(T)，速度快 2-4x
+  is_causal=True 自动应用因果 mask
+```
+
+
 
 ---
 
-## 3. MLP（前馈网络）
+## 四、MLP — 前馈网络
+
+### 源码
 
 ```python
 class MLP(nn.Module):
+
     def __init__(self, config):
-        self.c_fc   = nn.Linear(n_embd, 4 * n_embd)   # 升维 4x
-        self.gelu   = nn.GELU()
-        self.c_proj = nn.Linear(4 * n_embd, n_embd)   # 降回原维度
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)     # [B, T, C] → [B, T, 4C]
-        x = self.gelu(x)     # 非线性激活
-        x = self.c_proj(x)   # [B, T, 4C] → [B, T, C]
-        return self.dropout(x)
+        x = self.c_fc(x)       # 升维：768 → 3072
+        x = self.gelu(x)       # 非线性激活
+        x = self.c_proj(x)     # 降维：3072 → 768
+        x = self.dropout(x)    # 正则化
+        return x
 ```
 
-**分工：**
-- Attention：token 之间的**信息交换**（谁关注谁）
-- MLP：每个 token **独立**的非线性变换（知识存储在这里）
+### 形态变化
 
-**GELU vs ReLU：**
 ```
-ReLU:  max(0, x)    → x<0 时梯度=0（死神经元）
-GELU:  x·Φ(x)      → x<0 时有小梯度，更平滑
+输入:   (B, T, 768)
+  ↓ c_fc (Linear)
+        (B, T, 3072)     ← 升维 4 倍
+  ↓ GELU
+        (B, T, 3072)     ← 非线性，形状不变
+  ↓ c_proj (Linear)
+        (B, T, 768)      ← 降回原始维度
+  ↓ Dropout
+输出:   (B, T, 768)
+```
+
+### 为什么升维 4 倍？
+
+```
+Attention 做的是"信息整合"（不同 token 之间交流）
+MLP 做的是"信息处理"（对每个 token 独立做非线性变换）
+
+升维 4 倍 = 给模型一个更大的"思考空间"
+在这个高维空间里做非线性运算，再压回原维度
+```
+
+### GELU 激活函数
+
+```
+GELU(x) = x · Φ(x)   其中 Φ 是标准正态的 CDF
+
+与 ReLU 的对比：
+  ReLU(x)  = max(0, x)        ← 硬截断，x<0 直接变 0
+  GELU(x)  = x · Φ(x)        ← 软截断，x<0 时平滑趋向 0
+
+GELU 更平滑 → 梯度更连续 → 训练更稳定
+GPT-2/3/4 等大模型都用 GELU
+```
+
+### 参数量
+
+```
+c_fc:   768 × 3072 = 2,359,296 参数
+c_proj: 3072 × 768 = 2,359,296 参数
+总计:   ~4.7M 参数 / 每个 MLP 模块
+
+12 层 MLP 总计: ~56M 参数（占 GPT-2 124M 的近一半！）
 ```
 
 ---
 
-## 4. Block（完整 Transformer 层）
+## 五、Block — 一个 Transformer 层
+
+### 源码
 
 ```python
 class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))   # Pre-Norm + 残差
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.ln_1(x))    # 残差 + Pre-Norm Attention
+        x = x + self.mlp(self.ln_2(x))     # 残差 + Pre-Norm MLP
         return x
+```
+
+### 数据流图解
+
+```
+输入 x: (B, T, 768)
+    │
+    ├──────────────────────────┐
+    │                          │ (残差连接)
+    ↓                          │
+  LayerNorm (ln_1)             │
+    ↓                          │
+  CausalSelfAttention          │
+    ↓                          │
+    +  ←───────────────────────┘
+    │
+    ├──────────────────────────┐
+    │                          │ (残差连接)
+    ↓                          │
+  LayerNorm (ln_2)             │
+    ↓                          │
+  MLP                          │
+    ↓                          │
+    +  ←───────────────────────┘
+    │
+输出: (B, T, 768)
 ```
 
 ### Pre-Norm vs Post-Norm
 
 ```
-原始 Transformer (Post-Norm):
-  x → Attention → Add → LayerNorm → ...
+Post-Norm (原始 Transformer 论文):
+  x = LayerNorm(x + Attention(x))    ← Norm 在加法之后
 
-nanoGPT (Pre-Norm):
-  x → LayerNorm → Attention → Add → ...
-      ↑
-  先 Norm 再计算，梯度可直接通过残差路径流回，训练更稳定
+Pre-Norm (GPT-2 / nanoGPT 用的):
+  x = x + Attention(LayerNorm(x))    ← Norm 在子层之前
+
+Pre-Norm 的好处：
+  - 训练更稳定（梯度流更顺畅）
+  - 不容易梯度爆炸
+  - 不需要 learning rate warmup 就能训练（虽然还是用了）
 ```
 
-### 残差连接的意义
+### 残差连接的直觉
 
 ```
-x_new = x + f(LayerNorm(x))
+没有残差：x = f(x)
+  → 信息必须经过每一层的变换，深层模型信息衰减
 
-初始时 f ≈ 0 → x_new ≈ x
-梯度可以"跳过" Block 直接流回早期层
-→ 解决深层网络训练困难
+有残差：x = x + f(x)
+  → f(x) 只学"增量修正"
+  → 梯度可以直接通过 +x 回传（跳过 f）
+  → 深层模型也能训练
+```
+
+
+
+---
+
+## 六、GPTConfig — 模型配置
+
+### 源码
+
+```python
+@dataclass
+class GPTConfig:
+    block_size: int = 1024    # 最大序列长度（上下文窗口）
+    vocab_size: int = 50304   # 词表大小
+    n_layer: int = 12         # Transformer 层数
+    n_head: int = 12          # 注意力头数
+    n_embd: int = 768         # 嵌入维度
+    dropout: float = 0.0      # Dropout 概率
+    bias: bool = True         # 是否使用 bias
+```
+
+### 各参数详解
+
+| 参数 | 含义 | 为什么这个值？ |
+|------|------|----------------|
+| block_size=1024 | 最多看 1024 个 token 的历史 | GPT-2 原始设置 |
+| vocab_size=50304 | 词表大小 | GPT-2 实际是 50257，向上取整到 64 的倍数，GPU 运算更高效 |
+| n_layer=12 | 12 层 Transformer | GPT-2 small 设置 |
+| n_head=12 | 12 个注意力头 | head_dim = 768/12 = 64，常见选择 |
+| n_embd=768 | 嵌入维度 | GPT-2 small 设置 |
+| dropout=0.0 | 预训练不用 dropout | 数据量足够大时，模型不容易过拟合 |
+| bias=True | 默认有 bias | 设为 False 稍好一些（更现代的做法） |
+
+### GPT-2 系列配置
+
+```python
+config_args = {
+    'gpt2':        dict(n_layer=12, n_head=12, n_embd=768),   # 124M
+    'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M
+    'gpt2-large':  dict(n_layer=36, n_head=20, n_embd=1280),  # 774M
+    'gpt2-xl':     dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M
+}
+```
+
+### 参数量粗算（GPT-2 124M）
+
+```
+Embedding:     vocab_size × n_embd = 50304 × 768 = 38.6M
+Position Emb:  block_size × n_embd = 1024 × 768  = 0.8M (不计入有效参数)
+
+每层 Block:
+  c_attn:   768 × 2304 = 1.77M
+  c_proj:   768 × 768  = 0.59M
+  c_fc:     768 × 3072 = 2.36M
+  c_proj2:  3072 × 768 = 2.36M
+  LayerNorm × 2:        = ~0.003M
+  小计: ~7.1M
+
+12 层: 7.1M × 12 = 85.2M
+ln_f:  ~0.0015M
+lm_head: 与 wte 共享，不额外计算
+
+总计: 38.6M + 85.2M ≈ 124M ✓
 ```
 
 ---
 
-## 5. GPT（顶层模型）
+## 七、GPT 主类 — __init__（模型组装）
 
-### 初始化
-
-```python
-self.transformer = nn.ModuleDict(dict(
-    wte  = nn.Embedding(vocab_size, n_embd),   # Token Embedding
-    wpe  = nn.Embedding(block_size, n_embd),   # Position Embedding
-    drop = nn.Dropout(dropout),
-    h    = nn.ModuleList([Block(config) for _ in range(n_layer)]),
-    ln_f = nn.LayerNorm(n_embd),               # 最终 LayerNorm
-))
-self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-
-# ⭐ 权重共享：lm_head 与 token embedding 共享权重
-self.transformer.wte.weight = self.lm_head.weight
-```
-
-**权重共享（Weight Tying）：**
-```
-Token Embedding: vocab_size × n_embd  (50304 × 768 ≈ 3850 万参数)
-LM Head:         n_embd × vocab_size  (共享，节省 3850 万参数)
-
-好处：语义一致性 + 减少参数量
-```
-
-### 权重初始化
+### 源码
 
 ```python
-# 默认：正态分布 std=0.02
-torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+class GPT(nn.Module):
 
-# 残差路径上的投影层：缩小初始化（GPT-2 原始论文技巧）
-std = 0.02 / math.sqrt(2 * n_layer)
-# 防止 N 层残差叠加后数值爆炸
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        # ═══ 组装所有子模块 ═══
+        self.transformer = nn.ModuleDict(dict(
+            wte  = nn.Embedding(config.vocab_size, config.n_embd),  # token embedding
+            wpe  = nn.Embedding(config.block_size, config.n_embd),  # position embedding
+            drop = nn.Dropout(config.dropout),
+            h    = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),     # final layer norm
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # ═══ Weight Tying ═══
+        self.transformer.wte.weight = self.lm_head.weight
+        # 输入嵌入和输出投影共享同一个权重矩阵！
+        # 直觉：token→向量 和 向量→token 本质是同一个映射的正反方向
+        # 效果：减少 38.6M 参数，且效果更好
+
+        # ═══ 权重初始化 ═══
+        self.apply(self._init_weights)
+        # 对残差投影层特殊处理
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 ```
 
-### 前向传播
+### Weight Tying 深入理解
+
+```
+不共享时：
+  wte:     (50304, 768)   ← 38.6M 参数
+  lm_head: (768, 50304)   ← 38.6M 参数
+  总共 77.2M 参数
+
+共享后：
+  wte = lm_head.weight（同一块内存）
+  只有 38.6M 参数
+
+为什么可以共享？
+  wte:     token_id → 向量（"苹果" → [0.1, -0.3, ...]）
+  lm_head: 向量 → token_id 的分数
+
+  如果两个 token 的嵌入向量接近 → 它们在输出时也应该容易互相替代
+  这个假设在实践中成立，共享权重甚至比不共享效果更好
+```
+
+### 权重初始化策略
+
+```python
+def _init_weights(self, module):
+    if isinstance(module, nn.Linear):
+        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.bias is not None:
+            torch.nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+```
+
+```
+普通层：     N(0, 0.02)
+残差投影层： N(0, 0.02 / √(2 × n_layer))
+
+为什么残差投影要缩小？
+  每层有 2 个残差加法（attention + mlp）
+  12 层 = 24 次累加
+  如果每次加的方差都是 0.02² = 4e-4
+  累加后方差会变成 24 × 4e-4 → 太大
+
+  缩放 std /= √(2×12) ≈ 4.9
+  → 累加后方差保持在合理范围
+  → 防止深层模型初始输出爆炸
+```
+
+
+
+---
+
+## 八、GPT.forward() — 前向传播
+
+### 源码
 
 ```python
 def forward(self, idx, targets=None):
-    B, T = idx.size()
+    device = idx.device
+    b, t = idx.size()
+    assert t <= self.config.block_size
 
-    # Step 1: 位置索引
-    pos = torch.arange(0, T, dtype=torch.long, device=device)
+    pos = torch.arange(0, t, dtype=torch.long, device=device)  # [0, 1, 2, ..., t-1]
 
-    # Step 2: Embedding
-    tok_emb = self.transformer.wte(idx)   # [B, T, C] token 语义
-    pos_emb = self.transformer.wpe(pos)   # [T, C]    位置信息
+    # ═══ 嵌入层 ═══
+    tok_emb = self.transformer.wte(idx)   # (b, t) → (b, t, n_embd)
+    pos_emb = self.transformer.wpe(pos)   # (t,)   → (t, n_embd) → 广播到 (b, t, n_embd)
     x = self.transformer.drop(tok_emb + pos_emb)
 
-    # Step 3: 逐层 Block
+    # ═══ 堆叠 Transformer 层 ═══
     for block in self.transformer.h:
-        x = block(x)
+        x = block(x)                      # (b, t, n_embd) → (b, t, n_embd)
 
-    # Step 4: 最终 LayerNorm
-    x = self.transformer.ln_f(x)
+    # ═══ 最终归一化 ═══
+    x = self.transformer.ln_f(x)          # (b, t, n_embd)
 
-    # Step 5: 输出
+    # ═══ 输出 ═══
     if targets is not None:
-        # 训练：计算所有位置的 loss
-        logits = self.lm_head(x)                     # [B, T, vocab_size]
+        # 训练模式：计算所有位置的 loss
+        logits = self.lm_head(x)          # (b, t, vocab_size)
         loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1)
+            logits.view(-1, logits.size(-1)),  # (b*t, vocab_size)
+            targets.view(-1),                   # (b*t,)
+            ignore_index=-1
         )
     else:
-        # 推理：只取最后一个位置（效率优化）
-        logits = self.lm_head(x[:, [-1], :])         # [B, 1, vocab_size]
+        # 推理模式：只算最后一个位置（节省计算）
+        logits = self.lm_head(x[:, [-1], :])  # (b, 1, vocab_size)
         loss = None
 
     return logits, loss
 ```
 
+### 完整数据流
+
+```
+idx: (8, 1024)  ← 8个样本，每个1024个token id
+  ↓
+tok_emb: (8, 1024, 768)  ← 每个 token id 查表得到 768 维向量
+pos_emb: (1024, 768)     ← 每个位置一个 768 维向量（广播到 batch）
+  ↓ 相加 + Dropout
+x: (8, 1024, 768)
+  ↓ Block 0
+x: (8, 1024, 768)
+  ↓ Block 1
+  ...
+  ↓ Block 11
+x: (8, 1024, 768)
+  ↓ LayerNorm
+x: (8, 1024, 768)
+  ↓ lm_head (Linear)
+logits: (8, 1024, 50304)  ← 每个位置对所有 token 的"分数"
+  ↓ cross_entropy(logits, targets)
+loss: 标量              ← 所有位置的平均交叉熵损失
+```
+
+### 推理时的优化
+
+```python
+# 训练时：需要所有位置的 logits（因为每个位置都有 target）
+logits = self.lm_head(x)              # (b, t, vocab_size) — 全部位置
+
+# 推理时：只关心最后一个位置（自回归生成下一个 token）
+logits = self.lm_head(x[:, [-1], :])  # (b, 1, vocab_size) — 只要最后一个
+
+# 用 [-1] 而不是 -1 的原因：
+# x[:, -1, :]  → shape (b, n_embd)       ← 少了一个维度
+# x[:, [-1], :] → shape (b, 1, n_embd)   ← 保持 3D，后续处理一致
+```
+
+### Cross Entropy Loss 详解
+
+```python
+loss = F.cross_entropy(
+    logits.view(-1, logits.size(-1)),   # (b*t, vocab_size) = (8192, 50304)
+    targets.view(-1),                    # (b*t,) = (8192,)
+    ignore_index=-1                      # target=-1 的位置不计入 loss
+)
+```
+
+```
+Cross Entropy 做了什么：
+  1. logits → softmax → 概率分布 P
+  2. loss = -log(P[target])  对每个位置
+  3. 取所有位置的平均
+
+例：
+  logits = [2.1, 0.5, -1.0, 3.2, ...]  (50304维)
+  target = 3                             (正确答案是第3个token)
+  → softmax 后 P[3] = 0.35
+  → loss = -log(0.35) = 1.05
+
+ignore_index=-1：
+  padding 位置的 target 设为 -1
+  → 不参与 loss 计算
+```
+
 ---
 
-## 与原始 Transformer 的对比
+## 九、GPT.generate() — 自回归文本生成
 
-| 方面 | 原始论文（2017） | nanoGPT |
-|------|----------------|---------|
-| 架构 | Encoder + Decoder | **仅 Decoder** |
-| Norm 位置 | Post-Norm | **Pre-Norm** |
-| 位置编码 | 正弦固定编码 | **可学习 Embedding** |
-| 激活 | ReLU | **GELU** |
-| 注意力 | 手动实现 | **Flash Attention** |
-| 权重共享 | 无 | **lm_head ↔ wte** |
+### 源码
+
+```python
+@torch.no_grad()
+def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    for _ in range(max_new_tokens):
+        # 裁剪到上下文窗口
+        idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+
+        # 前向得到 logits
+        logits, _ = self(idx_cond)
+
+        # 取最后一个位置 + temperature 缩放
+        logits = logits[:, -1, :] / temperature
+
+        # Top-K 过滤
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
+
+        # Softmax → 概率
+        probs = F.softmax(logits, dim=-1)
+
+        # 从概率分布中采样
+        idx_next = torch.multinomial(probs, num_samples=1)
+
+        # 拼接到序列末尾
+        idx = torch.cat((idx, idx_next), dim=1)
+
+    return idx
+```
+
+### 生成过程图解
+
+```
+初始 prompt: "The cat"  → token ids: [464, 3797]
+
+Step 1:
+  输入: [464, 3797]
+  模型输出最后位置 logits → softmax → 采样 → "sat" (id=3332)
+
+Step 2:
+  输入: [464, 3797, 3332]
+  模型输出最后位置 logits → softmax → 采样 → "on" (id=319)
+
+Step 3:
+  输入: [464, 3797, 3332, 319]
+  ...
+
+每步用前面所有已生成的 token 作为输入，产出下一个 token
+这就是"自回归"（auto-regressive）
+```
+
+### Temperature 的效果
+
+```
+temperature = 1.0（默认）：原始概率分布
+temperature = 0.5（低）：分布更尖锐 → 更确定性 → 更"安全"但可能重复
+temperature = 1.5（高）：分布更平坦 → 更随机 → 更"创意"但可能胡说
+
+数学：logits / T → softmax
+  T 小 → logits 差距放大 → 高概率 token 更突出
+  T 大 → logits 差距缩小 → 所有 token 概率更均匀
+```
+
+### Top-K 采样
+
+```
+Top-K = 50：
+  只保留概率最高的 50 个 token
+  其余全部设为 -inf → softmax 后变 0
+  → 从这 50 个中采样
+
+作用：防止采样到极低概率的"垃圾" token
+```
+
+
 
 ---
 
-## 关键设计总结
+## 十、GPT.from_pretrained() — 加载预训练权重
 
-| 设计 | 选择 | 理由 |
+### 源码（简化注释版）
+
+```python
+@classmethod
+def from_pretrained(cls, model_type, override_args=None):
+    """从 HuggingFace 下载 GPT-2 权重并加载到 nanoGPT 模型"""
+
+    # 1. 创建 nanoGPT 模型（随机权重）
+    config = GPTConfig(**config_args)
+    model = GPT(config)
+    sd = model.state_dict()
+
+    # 2. 从 HuggingFace 下载 GPT-2 权重
+    from transformers import GPT2LMHeadModel
+    model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+    sd_hf = model_hf.state_dict()
+
+    # 3. 逐层复制权重
+    transposed = ['attn.c_attn.weight', 'attn.c_proj.weight',
+                  'mlp.c_fc.weight', 'mlp.c_proj.weight']
+    for k in sd_keys_hf:
+        if any(k.endswith(w) for w in transposed):
+            sd[k].copy_(sd_hf[k].t())   # Conv1D → Linear 需要转置
+        else:
+            sd[k].copy_(sd_hf[k])        # 直接复制
+    return model
+```
+
+### 为什么需要转置？
+
+```
+OpenAI 的 GPT-2 用了 Conv1D：
+  权重形状: (in_features, out_features) = (768, 2304)
+
+PyTorch 的 Linear：
+  权重形状: (out_features, in_features) = (2304, 768)
+
+它们数学上等价（y = xW^T vs y = Wx）
+但存储时转置了，所以加载时要 .t()
+
+涉及的层：c_attn, c_proj, c_fc, c_proj（所有做矩阵乘法的层）
+```
+
+---
+
+## 十一、GPT.configure_optimizers() — 优化器配置
+
+### 源码
+
+```python
+def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+
+    # 按维度分组：2D 以上（矩阵）做 weight decay，1D 以下（bias/norm）不做
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},      # 0.1
+        {'params': nodecay_params, 'weight_decay': 0.0},             # 0.0
+    ]
+
+    # 优先用 fused AdamW（CUDA 优化版，更快）
+    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+    use_fused = fused_available and device_type == 'cuda'
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas,
+                                   fused=use_fused)
+    return optimizer
+```
+
+### 为什么区分 decay / no-decay？
+
+```
+Weight Decay = 每步让权重衰减一点点: w = w - wd * w
+
+应该 decay 的（2D 矩阵权重）：
+  - Linear 的 weight（如 c_attn.weight, c_fc.weight）
+  - Embedding 的 weight
+  → 防止权重过大，起正则化作用
+
+不应该 decay 的（1D 参数）：
+  - bias 参数
+  - LayerNorm 的 weight/bias
+  → 这些参数本身就小，decay 会干扰训练
+```
+
+### Fused AdamW
+
+```
+普通 AdamW：
+  for param in params:
+    m = beta1 * m + (1-beta1) * grad
+    v = beta2 * v + (1-beta2) * grad²
+    param -= lr * m / (√v + eps) + wd * param
+  → 每个参数一次 GPU kernel 调用
+
+Fused AdamW：
+  把上面所有运算融合成一个 kernel
+  → 减少 kernel launch 开销
+  → 减少 GPU 内存读写次数
+  → 训练快 5-10%
+```
+
+---
+
+## 十二、GPT.estimate_mfu() — 浮点利用率估算
+
+### 源码
+
+```python
+def estimate_mfu(self, fwdbwd_per_iter, dt):
+    """估算相对于 A100 峰值的浮点利用率"""
+    N = self.get_num_params()
+    cfg = self.config
+    L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+
+    flops_per_token = 6*N + 12*L*H*Q*T
+    flops_per_fwdbwd = flops_per_token * T
+    flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+
+    flops_achieved = flops_per_iter / dt          # 实际 FLOPS
+    flops_promised = 312e12                        # A100 bf16 峰值: 312 TFLOPS
+    mfu = flops_achieved / flops_promised
+    return mfu
+```
+
+### FLOPs 公式解释（来自 PaLM 论文）
+
+```
+每个 token 的 FLOPs:
+  6N        ← 矩阵乘法的 FLOPs（前向 2N + 反向 4N = 6N）
+  + 12LHQT  ← 注意力矩阵的 FLOPs（QK^T 和 att@V）
+
+对于 GPT-2 124M (N=124M, L=12, H=12, Q=64, T=1024):
+  6N = 744M
+  12LHQT = 12×12×12×64×1024 = 113M
+  每 token: ~857M FLOPs
+
+每次迭代:
+  857M × 1024(T) × batch_size = ... 很大的数
+
+MFU = 实际 / A100 峰值(312T)
+  好的实现: MFU ~40-60%
+  说明 GPU 在忙着算，不是等数据
+```
+
+---
+
+## 十三、GPT.crop_block_size() — 模型裁剪
+
+### 源码
+
+```python
+def crop_block_size(self, block_size):
+    """缩小上下文窗口（模型手术）"""
+    assert block_size <= self.config.block_size
+    self.config.block_size = block_size
+    # 截断位置嵌入
+    self.transformer.wpe.weight = nn.Parameter(
+        self.transformer.wpe.weight[:block_size]
+    )
+    # 截断因果 mask
+    for block in self.transformer.h:
+        if hasattr(block.attn, 'bias'):
+            block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+```
+
+### 使用场景
+
+```
+加载 GPT-2 checkpoint（block_size=1024）
+但想用更短的上下文（如 256）进行快速实验
+
+crop_block_size(256):
+  wpe: (1024, 768) → (256, 768)   ← 只保留前 256 个位置
+  mask: (1,1,1024,1024) → (1,1,256,256)
+
+好处：推理更快、显存更少
+代价：不能看超过 256 个 token 的历史
+```
+
+---
+
+## 总结：model.py 的设计精髓
+
+### 1. 极简但完整
+
+```
+300 行代码 = 工业级 GPT 模型
+没有一行多余代码
+没有一个多余的抽象层
+```
+
+### 2. 关键设计决策
+
+| 决策 | 选择 | 原因 |
 |------|------|------|
-| Norm 位置 | Pre-Norm | 梯度流更稳定 |
+| Norm 位置 | Pre-Norm | 训练更稳定 |
 | 激活函数 | GELU | 比 ReLU 更平滑 |
-| 注意力 | Flash Attention | 节省显存，速度快 |
-| 权重共享 | lm_head ↔ wte | 减少参数，语义一致 |
-| 残差初始化 | 0.02/sqrt(2N) | 防止深层叠加爆炸 |
-| 推理优化 | 只取最后一位 logits | 推理时不需要所有位置 |
+| 位置编码 | 学习式（Embedding） | 简单，GPT-2 原始方案 |
+| Weight Tying | 是 | 减参、提效 |
+| Flash Attention | 自动检测 | 有就用，没有退回手动 |
+| bias | 可选（默认True） | 关闭稍好，更现代 |
 
----
+### 3. 与更现代架构的对比
 
-## 我的理解 / 疑问
+| 特性 | nanoGPT (GPT-2) | 现代 LLM (Llama/nanochat) |
+|------|-----------------|--------------------------|
+| 位置编码 | 学习式 | RoPE |
+| Norm | LayerNorm | RMSNorm |
+| 激活函数 | GELU | SwiGLU |
+| 注意力 | MHA | GQA / MQA |
+| FFN 倍数 | 4× | 8/3× (SwiGLU) |
+| bias | 有 | 无 |
 
-<!-- 在这里记录学习笔记 -->
+nanoGPT 选择了 GPT-2 的经典架构，目的是**教学清晰**而非最优性能。
