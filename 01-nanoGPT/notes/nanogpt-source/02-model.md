@@ -235,28 +235,209 @@ Attention(Q, K, V) = softmax(Q·K^T / √d_k) · V
   除以 √64=8 后，值保持在合理范围
 ```
 
-### 多头注意力图解
+### 多头注意力图解（详细版）
+
+#### 为什么 Q, K, V 要先"合起来"计算，再"分开"给各个头？
+
+**答案：效率。**
 
 ```
-n_embd = 768, n_head = 12, head_dim = 64
+方案 A（直觉但低效）：每个头各有一个独立的 Linear
+  head_0: Q₀ = Linear_q0(x), K₀ = Linear_k0(x), V₀ = Linear_v0(x)
+  head_1: Q₁ = Linear_q1(x), K₁ = Linear_k1(x), V₁ = Linear_v1(x)
+  ...
+  head_11: Q₁₁ = Linear_q11(x), ...
+  → 需要 12×3 = 36 个 Linear 层！
+  → 36 次矩阵乘法 → GPU 利用率低（每个矩阵太小）
 
-输入 x: (B, T, 768)
-         ↓ c_attn (一个 Linear)
-      (B, T, 2304)
-         ↓ split 成 3 份
-  Q(B,T,768)  K(B,T,768)  V(B,T,768)
-         ↓ view + transpose
-  Q(B,12,T,64) K(B,12,T,64) V(B,12,T,64)
-         ↓ 12 个头独立计算注意力
-  out(B,12,T,64)
-         ↓ transpose + view（拼接）
-      (B, T, 768)
-         ↓ c_proj
-      (B, T, 768)
+方案 B（nanoGPT 实际做法）：一个大 Linear，算完再拆
+  [Q_all; K_all; V_all] = 一个大Linear(x)    ← 只做 1 次矩阵乘法
+  然后 split → reshape → 拆分给 12 个头
 
-每个头只看 64 维的子空间 → 学到不同的"注意力模式"
-12 个头并行 → 同时关注语法、语义、位置关系等
+  本质上等价于方案 A，但：
+  - 1 次大矩阵乘法 vs 36 次小矩阵乘法
+  - GPU 更擅长大矩阵 → 硬件利用率高 2-5 倍
 ```
+
+数学上完全等价的原因：
+
+```
+大 Linear 的权重矩阵 W_attn shape = (768, 2304)
+
+实际上等于把 36 个小矩阵拼在一起：
+W_attn = [ W_q0 | W_q1 | ... | W_q11 | W_k0 | ... | W_k11 | W_v0 | ... | W_v11 ]
+            64      64          64       64          64       64          64
+
+y = x @ W_attn  ←→  分别计算 x @ W_q0, x @ W_q1, ... 然后拼起来
+```
+
+---
+
+#### view 和 transpose 的作用（用具体数字举例）
+
+以 **B=2, T=4, n_embd=12, n_head=3, head_dim=4** 为例（缩小版便于理解）：
+
+```python
+# 假设 c_attn 计算后，q 的形状是：
+q.shape = (2, 4, 12)
+# 含义：2 个样本，每个 4 个 token，每个 token 有 12 维
+
+# 我们要把 12 维拆给 3 个头，每个头分到 4 维
+```
+
+**Step 1: view — 把最后一维"切开"**
+
+```python
+q = q.view(2, 4, 3, 4)
+# (B, T, n_head, head_dim) = (2, 4, 3, 4)
+```
+
+```
+view 前：q[sample=0, token=0] = [a b c d | e f g h | i j k l]
+                                  ←───12维的一整条────────────→
+
+view 后：q[sample=0, token=0] = [[a b c d],   ← head 0 的 4 维
+                                  [e f g h],   ← head 1 的 4 维
+                                  [i j k l]]   ← head 2 的 4 维
+
+本质：只是"重新解读"内存布局，把 12 维看成 3×4，没有移动任何数据。
+```
+
+**Step 2: transpose(1, 2) — 交换 T 和 n_head 维度**
+
+```python
+q = q.transpose(1, 2)
+# (B, T, n_head, head_dim) → (B, n_head, T, head_dim)
+# (2, 4, 3, 4)            → (2, 3, 4, 4)
+```
+
+```
+transpose 前 (B, T, n_head, head_dim):
+  样本0:
+    token0: [head0=[a b c d], head1=[e f g h], head2=[i j k l]]
+    token1: [head0=[m n o p], head1=[q r s t], head2=[u v w x]]
+    token2: ...
+    token3: ...
+
+transpose 后 (B, n_head, T, head_dim):
+  样本0:
+    head0: [token0=[a b c d], token1=[m n o p], token2=..., token3=...]
+    head1: [token0=[e f g h], token1=[q r s t], token2=..., token3=...]
+    head2: [token0=[i j k l], token1=[u v w x], token2=..., token3=...]
+
+本质：把"按 token 组织"变成"按 head 组织"
+     每个 head 现在拥有所有 token 的信息 → 可以独立做注意力
+```
+
+**为什么要 transpose？**
+
+```
+注意力计算需要的格式：
+  Q @ K^T = (T, head_dim) @ (head_dim, T) → (T, T)
+
+如果不 transpose（保持 B, T, n_head, head_dim）：
+  矩阵乘法的最后两维是 (n_head, head_dim) @ (head_dim, n_head)
+  → 这不是我们想要的！
+
+transpose 后（B, n_head, T, head_dim）：
+  矩阵乘法的最后两维是 (T, head_dim) @ (head_dim, T) = (T, T)
+  → 这正是每个 head 的注意力分数矩阵 ✓
+
+GPU 的 batched matmul 会对前面的维度 (B, n_head) 并行
+→ 所有样本、所有头同时计算 → 极快
+```
+
+---
+
+#### 完整变换过程（真实数字 B=8, T=1024, n_embd=768, n_head=12）
+
+```
+输入 x: (8, 1024, 768)
+
+Step 1: c_attn 计算
+  x @ W_attn = (8, 1024, 768) @ (768, 2304) → (8, 1024, 2304)
+                                                    一次矩阵乘
+
+Step 2: split 成 Q, K, V
+  (8, 1024, 2304) → split(768, dim=2) → q, k, v 各 (8, 1024, 768)
+
+Step 3: view（拆成多头）
+  q: (8, 1024, 768) → view(8, 1024, 12, 64) = (8, 1024, 12, 64)
+     ← 768 = 12头 × 64维/头
+
+Step 4: transpose（head 维提前）
+  q: (8, 1024, 12, 64) → transpose(1,2) → (8, 12, 1024, 64)
+     ← 现在格式是：每个 head 拥有 1024 个 token 的 64 维向量
+
+Step 5: 注意力计算
+  att = q @ k.T = (8, 12, 1024, 64) @ (8, 12, 64, 1024) → (8, 12, 1024, 1024)
+                   ← 每个 head 一个 1024×1024 的注意力矩阵
+  y = att @ v = (8, 12, 1024, 1024) @ (8, 12, 1024, 64) → (8, 12, 1024, 64)
+
+Step 6: transpose 回来 + view 合并
+  y: (8, 12, 1024, 64) → transpose(1,2) → (8, 1024, 12, 64)
+  y: (8, 1024, 12, 64) → contiguous().view(8, 1024, 768)
+     ← 12头 × 64维 = 768维，重新合并成一个向量
+
+Step 7: 输出投影
+  y @ W_proj = (8, 1024, 768) @ (768, 768) → (8, 1024, 768)
+```
+
+---
+
+#### 为什么需要 .contiguous()？
+
+```python
+y = y.transpose(1, 2).contiguous().view(B, T, C)
+```
+
+```
+transpose 只是改变了"如何解读内存"的元信息（stride），
+并没有真正移动内存中的数据。
+
+view 要求内存必须是连续的（contiguous）。
+如果 transpose 后直接 view，会报错：
+  RuntimeError: view size is not compatible with input tensor's
+  size and stride (at least one dimension spans across two
+  contiguous subspaces)
+
+.contiguous() = 按照新的维度顺序，真正重新排列内存中的数据
+               之后就可以安全地 view 了
+
+代价：一次内存拷贝
+      但相比矩阵乘法的开销，可以忽略不计
+```
+
+---
+
+#### 多头注意力的直觉类比
+
+```
+类比：一篇文章，12 个人同时阅读
+
+  Head 0 ("语法专家")：关注主语和动词的对应关系
+    "猫  坐在  垫子  上"
+     ↑───┘
+     主语→动词
+
+  Head 1 ("位置专家")：关注相邻 token 的关系
+    "猫  坐在  垫子  上"
+         ↑───┘
+         相邻词依赖
+
+  Head 2 ("语义专家")：关注远距离语义关联
+    "那只昨天在花园里追蝴蝶的  猫  现在  坐在  垫子  上"
+     ↑──────────────────────────────────────┘
+     远距离共指
+
+  ... 12 个头各有各的"关注点"
+  
+  最后：把 12 个头的观察结果拼起来 → 输出投影 → 综合所有视角的信息
+```
+
+每个头只用 64 维（而非 768 维）做注意力：
+- **减少计算量**：768 维做一次注意力 vs 64 维做 12 次，FLOPs 相同但并行度更高
+- **增加表达力**：12 个头可以学到不同模式，一个 768 维大头只能学一种模式
 
 ### 因果 Mask 可视化
 
