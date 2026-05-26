@@ -892,6 +892,87 @@ forward() 是整个 GPT 模型的"主线路"：把 token id 进去，logits 和 
 输入：一批 token id 序列  →  输出：每个位置对下一个 token 的预测分数
 ```
 
+### idx 中的 token id 是如何来的？
+
+**分词器（Tokenizer）把原始文本切成子词片段，每个片段对应一个固定整数 id。**
+
+```
+原始文本:  "The cat sat on the mat"
+              ↓  分词器（GPT-2 BPE Tokenizer）
+token 列表: ["The", " cat", " sat", " on", " the", " mat"]
+              ↓  查词表（vocab_size=50257）
+token ids:  [464,   3797,   3332,  319,   262,   2603]
+              ↓  组成 tensor
+idx:        torch.tensor([[464, 3797, 3332, 319, 262, 2603]])  shape=(1,6)
+```
+
+#### nanoGPT 中的实际来源
+
+token id **不是训练时实时分词的**，而是提前离线处理好的：
+
+```python
+# ═══ 第一步：离线分词（data/openwebtext/prepare.py，只跑一次）═══
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")         # 加载 GPT-2 BPE 分词器
+
+# 把整个 OpenWebText 分词，存成二进制
+ids = enc.encode_ordinary(text)             # "The cat" → [464, 3797]
+np.array(ids, dtype=np.uint16).tofile('train.bin')
+# 输出: train.bin (~17GB, 9B 个 token id)
+
+# ═══ 第二步：训练时直接读取（train.py: get_batch()）═══
+data = np.memmap('train.bin', dtype=np.uint16, mode='r')  # 内存映射，不全部加载
+ix = torch.randint(len(data) - block_size, (batch_size,)) # 随机选起始位置
+x = torch.stack([data[i:i+block_size] for i in ix])       # → idx  (8, 1024)
+y = torch.stack([data[i+1:i+1+block_size] for i in ix])   # → targets (8, 1024)
+# x 和 y 相差一位：x=[The,cat,sat], y=[cat,sat,on]
+```
+
+#### BPE 分词器如何工作？
+
+```
+GPT-2 使用 Byte Pair Encoding (BPE)，词表 50257 个子词
+
+规则：
+  1. 最初每个字节是一个 token
+  2. 统计训练语料中最常见的相邻 token 对
+  3. 合并最常见的对 → 形成新 token
+  4. 重复直到词表达到目标大小
+
+结果：
+  常见词不拆:   "The"(464), " the"(262), " is"(318)
+  罕见词拆开:   "ChatGPT" → ["Chat", "G", "PT"]
+  子词片段:     "ing"(278), "tion"(1009), "un"(403)
+  单字符保底:   "a"(64), "z"(89)  ← 任何文本都能编码
+
+为什么用 BPE 不按字/按词分？
+  按字符: 词表小(65) 但序列太长（"hello"=5个token）
+  按词:   词表巨大(100万+)，新词 OOV
+  BPE:    词表适中(50257)，任何文本都能编码，效率和覆盖率的平衡点
+```
+
+#### 完整链路总结
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  训练前（离线，只做一次）                                 │
+│    原始文本 → BPE分词 → id数组 → train.bin              │
+├─────────────────────────────────────────────────────────┤
+│  训练时（每一步）                                        │
+│    train.bin → 随机取1024个连续id → idx (8,1024)        │
+│    idx右移一位 → targets (8,1024)                       │
+│    → model.forward(idx, targets) → loss → backward     │
+├─────────────────────────────────────────────────────────┤
+│  推理时                                                  │
+│    用户输入"The cat" → 分词器 → [464, 3797]             │
+│    → model.forward(idx) → logits → 采样 → 新id         │
+│    → 拼到idx后面 → 重复                                 │
+│    → 所有id → 分词器.decode() → 输出文字                │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
 ### 源码逐行解析
 
 ```python
