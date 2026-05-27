@@ -199,6 +199,102 @@ NANOCHAT_DTYPE=bfloat16 torchrun --nproc_per_node=8 -m scripts.base_train  # 强
 
 ---
 
+## 完整训练 Pipeline 源码对应
+
+### Stage 1：Tokenizer 训练
+
+**入口文件：** `scripts/tok_train.py`
+
+- 从预训练数据中读取约 **2B 字符**，训练 BPE 分词器
+- 词表大小 **32,768**，风格类似 GPT-4 分词器
+- 依赖：`nanochat/tokenizer.py`（`RustBPETokenizer`）、`nanochat/dataset.py`（数据读取）
+
+```bash
+python -m scripts.tok_train
+```
+
+---
+
+### Stage 2：预训练（Pretraining）
+
+**入口文件：** `scripts/base_train.py`
+
+- 最核心的训练文件，约 **400 行**
+- 唯一旋钮 `--depth` 自动推算所有超参：模型宽度、batch size、学习率、weight decay
+- 使用 **Muon + AdamW** 组合优化器，支持 FP8 训练（H100+）
+- 依赖：`nanochat/gpt.py`（模型架构 MQA + RoPE）、`nanochat/optim.py`（Muon 优化器）、`nanochat/dataloader.py`
+
+```bash
+torchrun --nproc_per_node=8 -m scripts.base_train --depth=26
+```
+
+---
+
+### Stage 3：中期训练（Midtraining）
+
+**入口文件：** `scripts/base_train.py`（**同一个文件**，换数据集）
+
+- 没有独立的 midtraining 脚本，通过 `--resume-from-step` 参数从预训练 checkpoint 继续训练
+- 区别在于喂入更高质量的数据子集（在 `nanochat/dataset.py` 中切换）
+
+---
+
+### Stage 4：SFT 微调
+
+**入口文件：** `scripts/chat_sft.py`
+
+- 加载预训练 base model，在对话数据上微调
+- **Loss masking**：只对 `<|assistant|>` 部分计算 loss，用户输入部分 mask 掉
+- 数据混合：SmolTalk + MMLU + GSM8K + SpellingBee + 合成身份数据
+- 依赖：`tasks/` 目录下各 task 文件（`smoltalk.py`、`gsm8k.py`、`mmlu.py` 等）
+
+```bash
+torchrun --nproc_per_node=8 -m scripts.chat_sft --device-batch-size=16
+```
+
+---
+
+### Stage 5：强化学习（RL，可选）
+
+**入口文件：** `scripts/chat_rl.py`
+
+- 基于 **GRPO/REINFORCE** 变体（非标准 PPO，已简化）
+- 在 **GSM8K 数学题**上做 RL，用答案是否正确作为 reward
+- 加载 SFT checkpoint，对输出采样多次，用 reward 计算 advantage，做策略梯度更新
+
+```bash
+torchrun --nproc_per_node=8 -m scripts.chat_rl --run=default
+```
+
+---
+
+### Stage 6：推理 / Web 服务
+
+**入口文件：** `scripts/chat_web.py`（Web UI）或 `scripts/chat_cli.py`（命令行）
+
+- FastAPI 服务，多 GPU worker pool 并行处理请求
+- 流式输出（SSE），支持 ChatGPT 风格对话界面
+- UI 在 `nanochat/ui.html`，推理引擎在 `nanochat/engine.py`（带 KV Cache）
+
+```bash
+python -m scripts.chat_web --num-gpus 4
+```
+
+---
+
+### 核心支撑模块
+
+| 文件 | 作用 |
+|------|------|
+| `nanochat/gpt.py` | GPT 模型定义（MQA + RoPE + LayerNorm） |
+| `nanochat/optim.py` | Muon + AdamW 优化器实现 |
+| `nanochat/tokenizer.py` | BPE 分词器封装 |
+| `nanochat/engine.py` | KV Cache 推理引擎 |
+| `nanochat/dataloader.py` | 分布式数据加载器 |
+| `nanochat/checkpoint_manager.py` | checkpoint 保存/加载 |
+
+---
+
 ## 贡献指南
 
 nanochat 的目标是提升预算低于 $1000 的微型模型的 SOTA 水平，并让端到端工作流程触手可及。"可及"不仅指成本，还指认知复杂度——nanochat 不是一个可无限配置的 LLM "框架"，代码库中没有庞大的配置对象、模型工厂或 if-else 怪兽，而是一个单一、内聚、极简、可读、易改造、最大程度可 fork 的"强基线"代码库，从头跑到尾即可得到一个可以对话的 ChatGPT 模型。
