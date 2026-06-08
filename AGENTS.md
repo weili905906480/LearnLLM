@@ -29,7 +29,7 @@ Python 代码使用 4 空格缩进，保持脚本简洁直接。可复用逻辑�
 
 ## 提交与 Pull Request 规范
 
-近期提交多使用简短祈使句，也会使用常见前缀，例如 `docs: add ...`、`chore: copy ...`、`add nanochat ... walkthrough`。每次提交聚焦一个主题。PR 应说明修改范围、列出已运行命令，并注明训练或 GPU 相关的硬件假设。只有修改 `nanochat/ui.html` 或 Web 服务等可见界面时才需要截图。
+近期提交多使用简短祈使句，也会使用常见前缀，例如 `docs: add ...`、`chore: copy ...`、`add nanochat ... walkthrough`。默认使用中文 Git 提交信息，除非用户明确要求英文或外部项目规范另有要求。每次提交聚焦一个主题。PR 应说明修改范围、列出已运行命令，并注明训练或 GPU 相关的硬件假设。只有修改 `nanochat/ui.html` 或 Web 服务等可见界面时才需要截图。
 
 ## 语言与文档要求
 
