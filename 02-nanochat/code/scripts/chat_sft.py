@@ -213,7 +213,10 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
             ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
+            # Skip conversations that are too long to fit in a single row
+            # This prevents batches with no valid training targets
+            if len(ids) <= row_capacity:
+                conv_buffer.append((ids, mask))
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size

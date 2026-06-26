@@ -72,9 +72,17 @@ def get_base_dir():
     if os.environ.get("NANOCHAT_BASE_DIR"):
         nanochat_dir = os.environ.get("NANOCHAT_BASE_DIR")
     else:
-        home_dir = os.path.expanduser("~")
-        cache_dir = os.path.join(home_dir, ".cache")
-        nanochat_dir = os.path.join(cache_dir, "nanochat")
+        # Try project-local .cache first (02-nanochat/.cache/nanochat), fall back to ~/.cache
+        # __file__ is nanochat/common.py, go up to code/, then up to 02-nanochat/
+        code_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        project_dir = os.path.dirname(code_dir)
+        project_cache = os.path.join(project_dir, ".cache", "nanochat")
+        if os.path.exists(project_cache):
+            nanochat_dir = project_cache
+        else:
+            home_dir = os.path.expanduser("~")
+            cache_dir = os.path.join(home_dir, ".cache")
+            nanochat_dir = os.path.join(cache_dir, "nanochat")
     os.makedirs(nanochat_dir, exist_ok=True)
     return nanochat_dir
 

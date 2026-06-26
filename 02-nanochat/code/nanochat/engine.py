@@ -27,10 +27,21 @@ def timeout(duration, formula):
     def timeout_handler(signum, frame):
         raise Exception(f"'{formula}': timed out after {duration} seconds")
 
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(duration)
-    yield
-    signal.alarm(0)
+    if hasattr(signal, 'SIGALRM'):
+        # Unix
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(duration)
+        yield
+        signal.alarm(0)
+    else:
+        # Windows - use threading
+        import threading
+        timer = threading.Timer(duration, lambda: (_ for _ in ()).throw(Exception(f"'{formula}': timed out after {duration} seconds")))
+        timer.start()
+        try:
+            yield
+        finally:
+            timer.cancel()
 
 def eval_with_timeout(formula, max_time=3):
     try:
@@ -39,7 +50,8 @@ def eval_with_timeout(formula, max_time=3):
                 warnings.simplefilter("ignore", SyntaxWarning)
                 return eval(formula, {"__builtins__": {}}, {})
     except Exception as e:
-        signal.alarm(0)
+        if hasattr(signal, 'alarm'):
+            signal.alarm(0)
         # print(f"Warning: Failed to eval {formula}, exception: {e}") # it's ok ignore wrong calculator usage
         return None
 
