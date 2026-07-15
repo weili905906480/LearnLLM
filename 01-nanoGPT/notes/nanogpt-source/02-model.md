@@ -788,7 +788,7 @@ class GPT(nn.Module):
 ```
 不共享时：
   wte:     (50304, 768)   ← 38.6M 参数
-  lm_head: (768, 50304)   ← 38.6M 参数
+  lm_head.weight: (50304, 768)   ← 38.6M 参数
   总共 77.2M 参数
 
 共享后：
@@ -802,6 +802,92 @@ class GPT(nn.Module):
   如果两个 token 的嵌入向量接近 → 它们在输出时也应该容易互相替代
   这个假设在实践中成立，共享权重甚至比不共享效果更好
 ```
+
+#### `wte.weight` 和 `lm_head.weight` 分别如何理解？
+
+两者的权重形状都为：
+
+```python
+( vocab_size, n_embd )
+# GPT-2 small / nanoGPT 默认值：
+(50304, 768)
+```
+
+这张矩阵有 `50304` 行，每一行对应词表中的一个 token；每行有 `768` 个数，组成该 token 的嵌入/候选向量：
+
+```text
+weight[0]      → token 0 的 768 维向量
+weight[1]      → token 1 的 768 维向量
+...
+weight[3797]   → token 3797（例如 " cat"）的 768 维向量
+...
+weight[50303]  → token 50303 的 768 维向量
+```
+
+**作为 `wte.weight` 使用时：按 id 查表。**
+
+```python
+tok_emb = self.transformer.wte(idx)
+```
+
+如果 `idx` 中某个位置的 token id 是 `3797`，模型便取出：
+
+```python
+wte.weight[3797]  # shape: (768,)
+```
+
+因此它完成的是：
+
+```text
+token id → 对应 token 的 768 维输入向量
+```
+
+**作为 `lm_head.weight` 使用时：与所有 token 向量逐一做点积。**
+
+Transformer 处理上下文后，在某位置得到隐藏状态 `h`：
+
+```text
+h.shape = (768,)
+```
+
+`lm_head` 的计算为：
+
+```python
+logits = h @ lm_head.weight.T
+```
+
+形状变化：
+
+```text
+h:                (768,)
+lm_head.weight.T: (768, 50304)
+logits:           (50304,)
+```
+
+也就是说，对词表中每个 token 都计算一个分数：
+
+```text
+logits[i] = h · lm_head.weight[i]
+```
+
+点积越大，表示当前上下文形成的隐藏状态 `h` 越符合 token `i`，模型就越倾向于将它预测为下一个 token。经过 `softmax` 后，`50304` 个 logits 才变为下一个 token 的概率分布。
+
+```text
+输入时（wte）：
+  token id i → weight[i]
+
+输出时（lm_head）：
+  h → [h·weight[0], h·weight[1], ..., h·weight[50303]]
+```
+
+所以 Weight Tying 并不是简单地让两个层“参数数量相同”，而是让同一张 token 向量表同时承担两种相反方向的职责：
+
+```text
+输入：把 token 映射到向量空间。
+输出：在向量空间中判断当前上下文最匹配哪个 token。
+```
+
+从训练目标看，反向传播会不断推动“能预测 token i 的上下文隐藏状态”与 `weight[i]` 更对齐；同时，该向量也会作为 token i 的输入表示被使用。因此共享不仅节约参数，也将输入表示和输出预测空间约束在同一语义空间中。
 
 ### 权重初始化策略
 
@@ -1335,7 +1421,7 @@ lm_head 本质上是在做"相似度匹配"：
   本质是同一张表的正反查询
 ```
 
-**为什么 `logits[i] = h · wte.weight[i]` 得到的是下一个 token 的分数？**
+**为什么 `logits[i] = h · lm_head.weight[i]` 得到的是下一个 token 的分数？**
 
 直觉上有个疑惑：h 是"当前位置"的向量，为什么点积能预测"下一个"词？
 
