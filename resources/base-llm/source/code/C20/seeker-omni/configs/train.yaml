@@ -1,0 +1,4 @@
+auto_init: true
+configs:
+  - configs/stages/s0.yaml
+  - configs/stages/sft_text.yaml

@@ -1,0 +1,34 @@
+seed: 42
+
+data:
+  train_dir: data/processed/text_sft_340
+  val_dir: null
+
+model:
+  base: !include ../model/base_26m.yaml
+  name: seeker-omni-zh-m2chatml-tok6400-sft-text-only
+  max_seq_len: 340
+
+train:
+  stage: sft
+  init_from: null
+  device: cuda
+  dtype: fp16
+
+  # 小规模 SFT 时保持 token 语义稳定。
+  freeze_base_embed: true
+
+  epochs: 1
+  batch_size: 16
+  grad_accum: 2
+  max_steps: 6000
+
+  lr: 5.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  warmup_steps: 200
+
+  log_every: 50
+  save_every: 500
+  keep_last: 2
+  out_dir: checkpoints/seeker-omni-zh-m2chatml-tok6400/sft_text_only

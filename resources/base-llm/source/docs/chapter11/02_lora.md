@@ -1,0 +1,377 @@
+# 第二节 LoRA 方法详解
+
+在上一节中，我们探讨了以 Adapter 和各类 Prompt Tuning 为代表的 PEFT 技术。它们通过在模型中**插入**新的模块或在输入端**添加**可学习的提示，巧妙地实现了高效微调。这些方法的核心，都是在尽量不“打扰”原始模型权重的前提下，通过影响模型的**激活值**来适应新任务。
+
+本节，我们将介绍一种另辟蹊径，也是当前社区应用最广泛的 PEFT 方法——**LoRA（Low-Rank Adaptation of Large Language Models）**。它不再“绕道而行”，而是直击模型的**权重矩阵**，并提出一个观点。那就是大模型的参数更新，或许并不需要那么“兴师动众”。
+
+## 一、低秩近似的核心思想
+
+全量微调之所以成本高昂，是因为它需要为模型中每一个权重矩阵 $W$（维度可能高达数万）计算并存储一个同样大小的更新矩阵 $ΔW$。为了解决这个问题，研究者们提出了像 Adapter Tuning 和 Prompt Tuning 这样的参数高效微调方法。但是，它们也存在一些未解决的痛点。Adapter 虽好，却会引入额外的**推理延迟**；Prompt Tuning 则会**占用输入序列长度**，且优化难度较高。
+
+有没有一种方法，既能大幅减少参数，又不引入推理延迟，还能直接作用于模型权重呢？这就是 LoRA 试图回答的问题。它的提出，源于一个假设 [^1]：
+
+> **大语言模型是过参数化的（Over-parametrized），它们在针对特定任务进行微调时，权重更新矩阵 $ΔW$ 具有一个很低的“内在秩”（Intrinsic Rank）**。
+
+这意味着，尽管 $ΔW$ 的维度很高，但它所包含的“有效信息”实际上可以被一个远小于其规模的低秩矩阵来表示。对此，LoRA 的核心思想就是用两个更小的“低秩”矩阵 $A$ 和 $B$ 的乘积，来模拟（近似）这个庞大的更新矩阵 $ΔW$。
+
+$$ \Delta W = B \cdot A $$
+
+其中， $W_0 \in \mathbb{R}^{d \times k}$，低秩分解后的 $B \in \mathbb{R}^{d \times r}$， $A \in \mathbb{R}^{r \times k}$，而秩 $r \ll \min(d, k)$。
+
+LoRA 的工作方式可以理解为在原始的预训练权重 $W_0$ 旁边，增加了一个并行的“旁路”结构，如图 11-7 计算分为两条路径：
+1. **主路**：输入 $x$ 经过原始的、被**冻结**的预训练权重 $W_0$。
+2. **旁路**：输入 $x$ 依次通过两个低秩矩阵 $A$ 和 $B$。矩阵 $A$ 先将输入维度从 $k$ “压缩”到一个很小的秩 $r$，然后再由矩阵 $B$ “解压”回输出维度 $d$。
+
+<p align="center">
+  <img src="./images/11_2_1.svg" width="50%" alt="LoRA 结构" />
+  <br />
+  <em>图 11-7 LoRA 结构示意图</em>
+</p>
+
+最终的输出 $h$ 是这两条路径结果的加和：
+
+$$ h = W_0 \cdot x + \Delta W \cdot x = W_0 \cdot x + (B \cdot A) \cdot x $$
+
+在训练时，只有旁路的矩阵 $A$ 和 $B$ 会被更新。通过这种方式，需要优化的参数量就从 $d \times k$ 下降到了 $d \times r + r \times k$。通常，秩 $r$ 会选择一个非常小的值（如 8, 16, 64），使得可训练参数量仅为全量微调的千分之一甚至万分之一。
+
+> **初始化与缩放技巧**
+>
+> - **初始化**：如图 11-7 所示，旁路矩阵有特殊的初始化方式。矩阵 A 通常使用高斯分布进行随机初始化（ $A = \mathcal{N}(0, \sigma^2)$ ），而矩阵 B 则初始化为全零（ $B=0$ ）。这样做可以确保在训练开始时，旁路输出为零，微调是从原始的预训练模型状态开始的，保证了训练初期的稳定性。
+> - **缩放**：LoRA 的前向计算公式会包含一个缩放因子 $s$: $h = W_0 \cdot x + s \cdot (B \cdot A) \cdot x$。这个 $s$ 通常设为 $\alpha/r$，其中 $\alpha$ 是一个可调超参。这个缩放操作有助于在调整秩 $r$ 时，减少对学习率等其他超参数的重新调整需求，让训练过程更稳定。
+
+## 二、LoRA 的优势与实践
+
+相比于之前介绍的 PEFT 方法，LoRA 以其独特的结构带来了显著的优势，下面来具体看一下。
+
+### 2.1 核心优势
+
+LoRA 凭借其独特的并行结构和直接作用于权重的特性，展现出几大核心优势：
+- **更高的参数与存储效率**：对于每一个下游任务，不再需要存储一个完整的模型副本，而只需保存极小的矩阵 A 和 B。论文指出，这可以将模型 checkpoints 的体积缩小高达 **10,000 倍**（例如从 350GB 减小到 35MB）。在训练时，由于无需为冻结的参数计算梯度和存储优化器状态，可以节省高达 **2/3 的 GPU 显存**，并提升约 **25% 的训练速度**。
+- **零额外推理延迟**：这是 LoRA 相比 Adapter Tuning 最具吸引力的优点。Adapter 在模型中串行地引入了新的计算层，不可避免地会增加推理延迟。而 LoRA 的旁路结构在训练完成后，可以通过矩阵加法 $(W' = W_0 + s \cdot B \cdot A)$ 直接“合并”回原始权重中。这样，模型的网络结构与原始模型完全一致，不会引入任何额外的计算步骤。
+    > 这种“合并”策略的代价是，如果你需要为 **不同的任务**（拥有不同的 LoRA 权重）同时提供服务，在单个 batch 中混合处理这些任务会变得不那么直接。
+- **效果媲美全量微调，且不占用输入长度**：与 Prompt-Tuning 等作用于输入激活值的方法不同，LoRA 直接修改权重矩阵，能更深入、更直接地影响模型的行为，效果也更接近于全量微调。同时，它不添加任何 virtual token，不会占用上下文长度，在处理长文本任务时更有优势。
+- **良好的可组合性**：LoRA 的设计是 **正交的**，它可以与 Prefix-Tuning 等其他 PEFT 方法结合使用，取长补短，进一步提升模型性能。
+
+### 2.2 关键实践
+
+LoRA 虽然强大，但也带来了新的超参数选择问题：应该对哪些权重矩阵应用 LoRA？秩 $r$ 又该如何选择？幸运的是，原始论文通过大量实验为我们提供了指导。
+
+第一个问题是：**应该对哪些权重矩阵应用 LoRA？**
+
+LoRA 的作者们为了简化问题和提高参数效率，将研究范围 **限定在了自注意力模块（Self-Attention）的权重矩阵** 上，并冻结了前馈网络等其他模块。在自注意力模块中，主要有四个权重矩阵：查询（Query）的 $W_q$、键（Key）的 $W_k$、值（Value）的 $W_v$ 和输出（Output）的 $W_o$。通过原文的实验数据（如表 11-1 所示）可以发现一个规律。在固定的可训练参数预算下，将 LoRA 应用于 **多种类型的注意力权重**（特别是 $W_q$ 和 $W_v$ 的组合）通常比把所有预算用于增大**单一类型权重**的秩（rank）效果更好。所以，原论文提出并验证了一个高效的策略：**仅在注意力模块中应用 LoRA，并冻结模型的其余部分**。
+
+<div align="center">
+
+<table border="1" style="margin: 0 auto;">
+<tr>
+  <td style="text-align: center;"></td>
+  <td colspan="7" style="text-align: center;"><strong># of Trainable Parameters = 18M</strong></td>
+</tr>
+<tr>
+  <td style="text-align: center;"><strong>Weight Type</strong></td>
+  <td style="text-align: center;">W<sub>q</sub></td>
+  <td style="text-align: center;">W<sub>k</sub></td>
+  <td style="text-align: center;">W<sub>v</sub></td>
+  <td style="text-align: center;">W<sub>o</sub></td>
+  <td style="text-align: center;">W<sub>q</sub>, W<sub>k</sub></td>
+  <td style="text-align: center;">W<sub>q</sub>, W<sub>v</sub></td>
+  <td style="text-align: center;">W<sub>q</sub>, W<sub>k</sub>, W<sub>v</sub>, W<sub>o</sub></td>
+</tr>
+<tr>
+  <td style="text-align: center;"><strong>Rank <i>r</i></strong></td>
+  <td style="text-align: center;">8</td>
+  <td style="text-align: center;">8</td>
+  <td style="text-align: center;">8</td>
+  <td style="text-align: center;">8</td>
+  <td style="text-align: center;">4</td>
+  <td style="text-align: center;">4</td>
+  <td style="text-align: center;">2</td>
+</tr>
+<tr>
+  <td style="text-align: center;"><strong>WikiSQL (&plusmn;0.5%)</strong></td>
+  <td style="text-align: center;">70.4</td>
+  <td style="text-align: center;">70.0</td>
+  <td style="text-align: center;">73.0</td>
+  <td style="text-align: center;">73.2</td>
+  <td style="text-align: center;">71.4</td>
+  <td style="text-align: center;">73.7</td>
+  <td style="text-align: center;">73.7</td>
+</tr>
+<tr>
+  <td style="text-align: center;"><strong>MultiNLI (&plusmn;0.1%)</strong></td>
+  <td style="text-align: center;">91.0</td>
+  <td style="text-align: center;">90.8</td>
+  <td style="text-align: center;">91.0</td>
+  <td style="text-align: center;">91.3</td>
+  <td style="text-align: center;">91.3</td>
+  <td style="text-align: center;">91.3</td>
+  <td style="text-align: center;">91.7</td>
+</tr>
+</table>
+
+<p><em>表 11-1 不同注意力权重上的 LoRA 微调效果</em></p>
+
+</div>
+
+第二个问题是：**秩 r 的选择是不是越大越好？**
+
+通过表 11-2 的实验结果可以看到，一个非常小的秩 $r$（例如 4, 8 甚至 1）就已经足够强大。盲目增大 $r$ 不仅会增加参数量，有时甚至会导致性能下降。例如，对于 $W_q$ 和 $W_v$ 的组合，即使秩 $r$ 仅为 1 或 2，模型在各项任务上的表现也已具竞争力，甚至超过了 $r=64$ 的情况。这说明权重更新确实是低秩的。
+
+<div align="center">
+
+<table border="1" style="margin: 0 auto;">
+<tr>
+  <td style="text-align: center;"></td>
+  <td style="text-align: center;"><strong>Weight Type</strong></td>
+  <td style="text-align: center;"><strong>r=1</strong></td>
+  <td style="text-align: center;"><strong>r=2</strong></td>
+  <td style="text-align: center;"><strong>r=4</strong></td>
+  <td style="text-align: center;"><strong>r=8</strong></td>
+  <td style="text-align: center;"><strong>r=64</strong></td>
+</tr>
+<tr>
+  <td rowspan="3" style="text-align: center;"><strong>WikiSQL(&plusmn;0.5%)</strong></td>
+  <td style="text-align: center;">W<sub>q</sub></td>
+  <td style="text-align: center;">68.8</td>
+  <td style="text-align: center;">69.6</td>
+  <td style="text-align: center;">70.5</td>
+  <td style="text-align: center;">70.4</td>
+  <td style="text-align: center;">70.0</td>
+</tr>
+<tr>
+  <td style="text-align: center;">W<sub>q</sub>, W<sub>v</sub></td>
+  <td style="text-align: center;">73.4</td>
+  <td style="text-align: center;">73.3</td>
+  <td style="text-align: center;">73.7</td>
+  <td style="text-align: center;">73.8</td>
+  <td style="text-align: center;">73.5</td>
+</tr>
+<tr>
+  <td style="text-align: center;">W<sub>q</sub>, W<sub>k</sub>, W<sub>v</sub>, W<sub>o</sub></td>
+  <td style="text-align: center;">74.1</td>
+  <td style="text-align: center;">73.7</td>
+  <td style="text-align: center;">74.0</td>
+  <td style="text-align: center;">74.0</td>
+  <td style="text-align: center;">73.9</td>
+</tr>
+<tr>
+  <td rowspan="3" style="text-align: center;"><strong>MultiNLI (&plusmn;0.1%)</strong></td>
+  <td style="text-align: center;">W<sub>q</sub></td>
+  <td style="text-align: center;">90.7</td>
+  <td style="text-align: center;">90.9</td>
+  <td style="text-align: center;">91.1</td>
+  <td style="text-align: center;">90.7</td>
+  <td style="text-align: center;">90.7</td>
+</tr>
+<tr>
+  <td style="text-align: center;">W<sub>q</sub>, W<sub>v</sub></td>
+  <td style="text-align: center;">91.3</td>
+  <td style="text-align: center;">91.4</td>
+  <td style="text-align: center;">91.3</td>
+  <td style="text-align: center;">91.6</td>
+  <td style="text-align: center;">91.4</td>
+</tr>
+<tr>
+  <td style="text-align: center;">W<sub>q</sub>, W<sub>k</sub>, W<sub>v</sub>, W<sub>o</sub></td>
+  <td style="text-align: center;">91.2</td>
+  <td style="text-align: center;">91.7</td>
+  <td style="text-align: center;">91.7</td>
+  <td style="text-align: center;">91.5</td>
+  <td style="text-align: center;">91.4</td>
+</tr>
+</table>
+
+<p><em>表 11-2 不同秩 r 对 LoRA 微调效果的影响</em></p>
+
+</div>
+
+最后一个问题是，**LoRA 究竟是如何生效的？** 论文通过分析发现，它学习到的更新矩阵 $\Delta W$ 并不是对原始权重 $W_0$ 中最重要特征的简单复制，恰恰相反，它学习到的是那些**在预训练中学习到但未被充分强调、却对下游任务至关重要的“隐藏特征”，并对其进行大幅放大**。它不是在重复模型已经很擅长的事情，而是在“查缺补漏”，精准地增强了模型在特定任务上所欠缺的能力。
+
+## 三、AdaLoRA 自适应微调
+
+尽管我们根据上述实验知道了应该优先微调注意力权重、并选择一个较小的秩 r，但 LoRA 这种固定的设置方式仍然引入了新的问题：
+- **秩 $r$ 的选择**： $r$ 应该设为多大？这是一个固定的超参数，无法在训练中自适应调整。
+- **微调目标的选择**：应该对哪些权重矩阵（ $W_q, W_k, W_v, W_o$ 还是前馈网络的矩阵）应用 LoRA？原始 LoRA 论文的实验主要集中在注意力模块，忽略了 FFN 模块，但后续研究发现 FFN 的微调同样重要。
+
+实验表明，为所有矩阵和所有层级设置一个统一的、固定的秩 $r$，远非最优解。不同任务、不同模型层、不同权重矩阵，其“可塑性”和对任务的重要性是不同的，它们理应被区别对待。手动为每个矩阵和层级寻找最优秩的组合，其超参数空间巨大，几乎不可能完成。不过，如图 11-8 所示的实验，已经揭示了这种重要性的差异：
+- **图左侧**显示，在固定的参数预算下，微调前馈网络（FFN）模块的权重（$W_{f1}, W_{f2}$）带来的性能收益，显著高于微调注意力模块的权重（$W_q, W_k, W_v, W_o$）。
+- **图右侧**则表明，微调模型更高层级（如 10-12 层）的权重，也比微调底层（如 1-3 层）能带来更大的性能提升。
+
+<p align="center">
+  <img src="./images/11_2_2.png" width="70%" alt="AdaLoRA 动机" />
+  <br />
+  <em>图 11-8 不同模块与层级的微调性能对比</em>
+</p>
+
+为了解决固定秩分配的次优性与手动调参的困难，AdaLoRA (Adaptive LoRA) [^2] 提出了一种更智能的、自适应的 LoRA 方案——**根据权重的重要性，动态地、有选择地为不同模块分配参数预算**。AdaLoRA 不再使用固定的秩 $r$，而是让模型在训练过程中自己“决定”哪些部分更需要被微调，以及需要多大的“力度”（秩）去微调。这一过程主要包含三个关键创新。
+
+### 3.1 基于 SVD 的参数化
+
+AdaLoRA 的第一步，是对 LoRA 的低秩分解形式进行了改进。它不再是使用两个简单的矩阵 $B \cdot A$，而是引入了经典的**奇异值分解 (SVD)** 思想来参数化更新矩阵 $\Delta W$：
+
+$$
+\Delta W = P \Lambda Q
+$$
+
+在机器学习和信号处理中，SVD 是一种强大的矩阵分解技术，能将任意矩阵分解为三个矩阵的乘积：一个左奇异向量矩阵 $P$、一个对角矩阵 $\Lambda$ 和一个右奇异向量矩阵 $Q$。其中，对角线上的奇异值代表了数据中最重要的主成分。AdaLoRA 正是借鉴了这一思想。
+
+这种参数化方式有两大好处：
+1. **避免了高昂的计算成本**：它只是在形式上**模拟**了 SVD，在训练时 $P, \Lambda, Q$ 都是可训练的参数，并不需要对 $\Delta W$ 进行真正的、计算开销极大的 SVD 分解。
+2. **结构化的重要性**：这种分解将 $\Delta W$ 的更新信息解耦为三个部分： $P$ 和 $Q$ 决定了更新的“方向”，而 $\Lambda$ 中的奇异值 $\lambda_i$ 则决定了在对应方向上的更新“幅度”。这使得我们可以通过调整奇异值的大小来直接控制每个“更新分量”的重要性，也即调整矩阵的秩。
+
+为确保 $P$ 和 $Q$ 在训练中保持正交性（这是奇异向量的性质），AdaLoRA 还在训练损失中加入了一个**正交正则化项**，以保证分解的稳定性和有效性。
+
+### 3.2 重要性评分与动态预算分配
+
+有了 SVD 这种分解结构，AdaLoRA 接下来要解决的问题就是**如何衡量每个“更新分量”的重要性？**
+
+它将每个奇异值和其对应的左右奇异向量组合成一个“**三元组**” $\mathcal{G}_{k,i} = \{P_{k,\ast i}, \lambda_{k,i}, Q_{k,i \ast}\}$。在训练过程中，AdaLoRA 会为每个三元组计算一个重要性分数 $S_{k,i}$。这个分数是基于对三元组中每个参数 $w$ 的重要性 $s(w)$ 进行聚合得到的。
+
+参数 $w$ 的重要性 $s(w)$ 由两部分相乘得到，分别是平滑后的**参数敏感度 (Sensitivity)** $\bar{I}(w)$ 和**不确定性 (Uncertainty)** $\bar{U}(w)$。
+
+- **参数敏感度 `I`**：它被定义为参数自身大小与其梯度的乘积的绝对值，即 $I(w) = |w \cdot \nabla_w \mathcal{L}|$。其直观含义是：如果将这个参数 $w$ 置零，模型损失会发生多大的变化。敏感度越高，说明该参数对当前任务的性能影响越大。
+- **平滑与不确定性 `U`**：由于训练是分批次（mini-batch）进行的，单个批次计算出的梯度具有随机性，导致敏感度 `I` 的值会剧烈波动。为了得到更稳定的评估，AdaLoRA 引入了**指数移动平均 (EMA)** 来对敏感度和不确定性进行平滑处理：
+
+    $$
+    \bar{I}^{(t)}(w) = \beta_1 \bar{I}^{(t-1)}(w) + (1-\beta_1)I^{(t)}(w)
+    $$
+
+    $$
+    \bar{U}^{(t)}(w) = \beta_2 \bar{U}^{(t-1)}(w) + (1-\beta_2)|I^{(t)}(w) - \bar{I}^{(t)}(w)|
+    $$
+
+    其中， $\bar{I}^{(t)}$ 是平滑后的敏感度，而 $\bar{U}^{(t)}$ 则量化了瞬时敏感度与平滑后值的偏差，即“不确定性”。一个参数如果不仅敏感度高，而且这种敏感性在训练中持续稳定出现（即不确定性低），那么它就更重要。
+
+最终，单个三元组的重要性分数 $S_{k,i}$ 由其内部所有参数的重要性聚合而成：
+
+$$
+S_{k,i} = s(\lambda_{k,i}) + \frac{1}{d_1}\sum_{j=1}^{d_1}s(P_{k,ji}) + \frac{1}{d_2}\sum_{j=1}^{d_2}s(Q_{k,ij})
+$$
+
+其中 $d_1 = d,\ d_2 = k$（对应 $\Delta W\in\mathbb{R}^{d\times k}$）。
+
+在计算出所有三元组的重要性分数后，AdaLoRA 会进行排序，并根据一个预设的**参数预算（总秩）**，**裁剪**掉那些得分最低的三元组（即将它们对应的奇异值 $\lambda_i$ 置为 0），从而实现了参数的动态分配。
+
+### 3.3 全局预算调度器与目标函数
+
+为了让训练过程更加稳定和高效，AdaLoRA 的整体**目标函数** `L` 包含了原始的损失函数 `C` 和我们前面提到的正交正则项 `R`：
+
+$$
+\mathcal{L}(\mathcal{P},\mathcal{E},\mathcal{Q}) = \mathcal{C}(\mathcal{P},\mathcal{E},\mathcal{Q}) + \gamma \sum_{k=1}^n R(P_k,Q_k)
+$$
+
+同时，它还引入了**全局预算调度器 (Global Budget Scheduler)** 的策略。这里的“预算” $b(t)$，指的就是在训练的第 $t$ 步，模型总共保留的奇异值的数量。它由一个分段函数精确控制：
+
+$$
+b^{(t)} = \begin{cases}
+b^{(0)} & 0 \le t < t_i \\
+b^{(T)} + (b^{(0)} - b^{(T)})\left(1 - \frac{t - t_i}{T - t_i - t_f}\right)^3 & t_i \le t < T-t_f \\
+b^{(T)} & \text{otherwise}
+\end{cases}
+$$
+
+这个调度策略包含三个阶段：
+1. **热身阶段 ($0 \le t < t_i$)**：从一个比目标预算 $b^{(T)}$ 略高的初始预算 $b^{(0)}$ 开始训练，让模型有更充分的机会去“探索”所有参数的潜在重要性。
+2. **裁剪阶段 ($t_i \le t < T-t_f$)**：按照一个**三次方的调度曲线**，逐步地裁剪掉重要性分数较低的奇异值，将预算平滑地降低到最终的目标值。
+3. **微调阶段**：在预算分配基本稳定后，固定预算为 $b^{(T)}$（即锁定了最重要的参数），继续对模型进行微调直至收敛。
+
+这种“先探索、后收敛”的策略，让模型有更充分的机会去发现哪些权重真正重要，从而做出更优的预算分配决策。最终，AdaLoRA 实现了在训练过程中对秩的**动态调整**和在不同模块间的**智能分配**。
+
+在图 11-9 中可以看到，模型自动为 FFN 模块（ $W_{f1}, W_{f2}$ ）以及模型的高层（层级 6-12）分配了更高的秩（颜色更深），这与图 11-8 的实验观察完全吻合，证明了其自适应机制的有效性。
+
+<p align="center">
+  <img src="./images/11_2_3.png" width="90%" alt="AdaLoRA 最终秩分配结果示意图" />
+  <br />
+  <em>图 11-9 AdaLoRA 最终秩分配结果示意图</em>
+</p>
+
+> **与 Adapter、SVD 主题模型的联系**
+> 
+> - **与 Adapter Tuning**：两者都采用了“高维 → 低维 → 高维”的瓶颈结构。但 Adapter 是作用于 **激活值** 的 **串行** 模块（增加推理延迟），而 LoRA/AdaLoRA 是作用于**权重**的**并行**支路（可合并，无额外延迟）。AdaLoRA 在结构上更高效。
+> - **与 SVD 主题模型**：在第二章第三节的中学习中，我们提到过 SVD 在主题模型中被用于分解“词-文档”矩阵，以发现最重要的“**语义主题**”（数据层面的低秩近似）。而 AdaLoRA 则创造性地将 SVD 的思想用于分解“**权重更新矩阵**”，以找到最关键的“**参数变化方向**”（模型层面的低秩近似）。
+
+论文的实验结果也表明，AdaLoRA 的自适应机制是有效的。它能自动发现**前馈网络**和**模型顶层**的权重矩阵更为重要，并为其分配更高的秩。此外，消融实验证明，**即使不使用动态预算分配，仅仅将参数化形式从 $B \cdot A$ 替换为 $P \Lambda Q$，就已经能带来性能提升**，说明 SVD 结构本身的优越性。这种自适应的机制，让 AdaLoRA 在相同的参数预算下，往往能达到比原始 LoRA 更好的性能，进一步提升了参数高效微调的水平。
+
+## 四、QLoRA 参数压缩
+
+LoRA 和 AdaLoRA 分别从“低秩近似”和“自适应秩分配”两个角度优化了微调过程，但它们都还有一个共同的前提，原始的、被冻结的大模型权重仍然是以较高的精度（如 FP16 或 BF16）加载到显存中的。对于动辄几百上千亿参数的模型来说，这部分权重本身就是一笔巨大的显存开销。
+
+华盛顿大学的研究者们提出了 **QLoRA (Quantized LoRA)**，一种更高阶的参数高效微调方法 [^3]。它通过一系列压缩技术，实现了很不错的效果。在保持与 16-bit 全量微调相当性能的同时，**成功将一个 65B（650 亿）参数模型的微调任务，压缩到了一块 48GB 显存的 GPU 上**。如图 11-10 所示，与冻结 16-bit 模型的标准 LoRA 相比，QLoRA 更进一步，将基座模型**量化为 4-bit**。训练时，梯度会穿过被冻结的 4-bit 模型，反向传播到 16-bit 的适配器中，并只更新适配器参数。此外，它还引入了 **分页优化器**，在显存不足时，可以将优化器状态临时卸载到 CPU 内存，从而有效管理内存峰值。
+
+<p align="center">
+  <img src="./images/11_2_4.png" width="80%" alt="QLoRA 与其他方法对比" />
+  <br />
+  <em>图 11-10 全量微调、LoRA 与 QLoRA 的机制对比</em>
+</p>
+
+基于这些创新，QLoRA 训练出的 Guanaco 模型系列，在 Vicuna 基准测试中甚至达到了 ChatGPT 99.3% 的性能水平，而这仅仅需要单张 GPU 训练 24 小时。QLoRA 的成功，主要归功于三方面的创新：**4-bit NormalFloat (NF4)**、**双量化 (Double Quantization)** 和**分页优化器 (Paged Optimizers)**。
+
+### 4.1 4-bit NormalFloat 数据类型
+
+**量化**是模型压缩领域的常用技术，通过用更少的信息位数（bit）来表示数值，从而减小模型体积和显存占用。然而，传统的量化方法（如均匀量化）在面对神经网络权重时会遇到一个难题：权重值的分布通常是**零中心的正态分布**，其中大部分值集中在 0 附近，而少量“离群值”的绝对值又非常大。均匀的量化策略无法很好地适应这种非均匀分布，导致较大的精度损失。
+
+以一个典型的 8-bit 均匀量化为例，其量化过程由以下公式定义：
+
+$$
+\mathbf{X}^{\text{Int8}} = \text{round}\left(\frac{127}{\text{absmax}(\mathbf{X}^{\text{FP32}})} \mathbf{X}^{\text{FP32}}\right) = \text{round}(c^{\text{FP32}} \cdot \mathbf{X}^{\text{FP32}})
+$$
+
+这个过程依赖于 `absmax` 缩放，即找到张量中的绝对值最大值来计算缩放系数，也就是 **量化常数** $c^{\text{FP32}}$。这种方法对离群值非常敏感，也是它的主要局限性。反量化则是其逆过程：
+
+$$
+\text{dequant}(c^{\text{FP32}}, \mathbf{X}^{\text{Int8}}) = \frac{\mathbf{X}^{\text{Int8}}}{c^{\text{FP32}}} \approx \mathbf{X}^{\text{FP32}}
+$$
+
+理解这个基础过程，特别是“量化常数”的概念，对于我们后续理解 QLoRA 的双量化会有所帮助。
+
+那么，为了解决传统量化方法的问题，QLoRA 提出了一种专门为正态分布权重设计的 4-bit 数据类型——**NormalFloat (NF4)**。它被证明是一种 **信息论上最优** 的数据类型，其设计哲学基于“**分位数量化（Quantile Quantization）**”。
+
+**分位数量化旨在让每个量化“桶”中，都包含相同数量的来自目标分布的值**。这意味着，在数据密集的区域（如正态分布的中心），量化点会更密集；在数据稀疏的区域（如分布的两尾），量化点会更稀疏。NF4 的具体构建步骤如下：
+1.  **确定理论分布**：首先，构建一个理论上的标准正态分布 $N(0, 1)$。
+2.  **计算分位数**：为这个标准正态分布精确计算出 $2^4 = 16$ 个值，这些值能将该分布的累积密度函数（CDF）划分为 16 个等概率的区间。这些计算出的分位数点，就构成了 NF4 数据类型能够表示的所有数值。
+3.  **归一化与量化**：在对实际的模型权重（通常以 block 为单位处理）进行量化时，首先通过“绝对值最大缩放”（absmax rescaling）进行归一化。具体来说，就是找到当前权重块中的绝对值最大值，并计算出其缩放因子，这个因子就是该块的 **量化常数**，它通常是一个 32-bit 浮点数。将块内所有权重都乘以这个缩放因子，就可以将它们的数值范围归一化到 $[-1, 1]$ 区间。最后，将每一个归一化后的权重值，映射到离它最近的 NF4 分位数点上。
+
+更精确地说，一个 k-bit 的 NormalFloat 数据类型（NFk）包含 $2^k$ 个量化点（$q_i$），其数值是通过以下公式估算的：
+
+$$
+q_i = \frac{1}{2} \left( Q_X\left(\frac{i}{2^k+1}\right) + Q_X\left(\frac{i+1}{2^k+1}\right) \right)
+$$
+
+这里的 $Q_X(\cdot)$ 是标准正态分布 $N(0, 1)$ 的**分位数函数**（Quantile Function）。该函数的作用是，给定一个概率值 $p$（在 0 到 1 之间），它能返回在该概率点上的具体数值。公式中的 $\frac{i}{2^k+1}$ 和 $\frac{i+1}{2^k+1}$ 就是将累积概率分布划分为 $2^k+1$ 个等份的点。整个公式的含义是，第 $i$ 个量化点 $q_i$ 的值，被定义为标准正态分布中第 $i$ 个和第 $i+1$ 个等概率区间隔断点的中点。
+
+通过这种方式，NF4 用极其有限的 4 个 bit，实现了对正态分布数据的高精度近似，最大程度地保留了原始权重中的信息，远优于传统的 4-bit 整数或浮点数量化。
+
+### 4.2 双量化与分页优化器
+
+除了开创性的 NF4 数据类型，QLoRA 还引入了另外两项技术来进一步压缩显存。
+
+- **双量化 (Double Quantization, DQ)**：上述量化过程需要为每一组（block）权重存储一个对应的“量化常数”（通常是 32-bit 的浮点数）。对于一个巨大的模型，这些量化常数累加起来也会占用相当大的显存。例如，对于一个 block size 为 64 的权重块，这些常数平均会给每个参数带来 $32 / 64 = 0.5$ bit 的额外开销。双量化的思想是，**对这些量化常数本身，再进行一次量化**。通过用 8-bit 浮点数对第一级量化常数进行第二级量化，可以将这部分额外开销从每参数 0.5 bit 大幅降低到约 0.127 bit。
+
+- **分页优化器 (Paged Optimizers)**：在微调过程中，梯度和优化器状态（如 Adam 算法中的动量和方差）会产生瞬时的显存峰值，尤其是在处理长序列时，很容易导致显存溢出（Out-of-Memory, OOM）。分页优化器借鉴了操作系统中“虚拟内存”的思想，它利用 **NVIDIA 统一内存（Unified Memory）** 的特性，在 GPU 显存不足时，能自动地、按需地将一部分优化器状态“分页”暂存到 CPU 内存中，待需要时再加载回 GPU。这极大地提高了训练过程的稳定性，避免了因偶然的显存峰值而导致的训练失败。
+
+### 4.3 QLoRA 的工作流程
+
+结合上述技术，QLoRA 的完整微调流程可以概括为一种“**存算分离**”的巧妙设计：它使用一种低精度的数据类型进行 **存储**，但在计算时又恢复为高精度。整个流程可以分为以下几个步骤：
+
+1.  **加载与量化 (存)**：加载 16-bit 的预训练模型，然后将其权重 **量化** 为 **4-bit 的 NF4 格式**，并应用 **双量化** 进一步压缩量化常数。此时，巨大的基座模型以极低的显存占用被冻结在 GPU 中。
+2.  **前向传播 (算)**：在模型中插入 LoRA 适配器，其权重保持为 16-bit 精度（BF16）。当进行前向计算时，需要使用的基座模型权重会被 **动态地反量化回 16-bit 的 BF16 格式**。计算完成后，这些临时的 16-bit 权重立即被丢弃，显存得以释放。
+3.  **反向传播与更新**：在反向传播过程中，**梯度只会通过冻结的 4-bit 模型反向传播到 16-bit 的 LoRA 适配器中**，并只更新适配器的权重。如果出现显存峰值，**分页优化器** 会介入，防止 OOM 发生。
+
+这个“存算分离”的前向传播过程，可以用以下公式进行精确地数学描述：
+
+$$
+\mathbf{Y}^{\text{BF16}} = \mathbf{X}^{\text{BF16}}\text{doubleDequant}(c_1^{\text{FP32}}, c_2^{\text{k-bit}}, \mathbf{W}^{\text{NF4}}) + \mathbf{X}^{\text{BF16}}\mathbf{L}_1^{\text{BF16}}\mathbf{L}_2^{\text{BF16}}
+$$
+
+- **第一部分（主路）**：`doubleDequant` 函数对应了步骤 2 中的核心操作，它将 4-bit 的权重 $\mathbf{W}^{\text{NF4}}$ 动态恢复为 16-bit，再与 16-bit 的输入 $\mathbf{X}^{\text{BF16}}$ 相乘。
+- **第二部分（旁路）**： $\mathbf{X}^{\text{BF16}}\mathbf{L}_1^{\text{BF16}}\mathbf{L}_2^{\text{BF16}}$ 则是标准的 LoRA 模块，其计算全程保持 16-bit 精度。
+
+---
+
+## 参考文献
+
+[^1]: [Hu, E. J., Shen, Y., Wallis, P., et al. (2021). *LoRA: Low-Rank Adaptation of Large Language Models*. arXiv preprint arXiv:2106.09685.](https://arxiv.org/abs/2106.09685)
+
+[^2]: [Zhang, Q., Chen, Y., Zha, D., et al. (2023). *Adaptive Budget Allocation for Parameter-Efficient Fine-Tuning*. arXiv preprint arXiv:2303.10512.](https://arxiv.org/abs/2303.10512)
+
+[^3]: [Dettmers, T., Pagnoni, A., Holtzman, A., & Zettlemoyer, L. (2023). *QLoRA: Efficient Finetuning of Quantized LLMs*. arXiv preprint arXiv:2305.14314.](https://arxiv.org/abs/2305.14314)

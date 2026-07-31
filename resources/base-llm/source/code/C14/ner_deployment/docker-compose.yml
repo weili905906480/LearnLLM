@@ -1,0 +1,7 @@
+services:
+  ner_api:
+    build: .
+    container_name: ner_api_service
+    ports:
+      - "8000:8000"
+    restart: always

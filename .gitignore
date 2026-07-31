@@ -26,6 +26,7 @@ Thumbs.db
 *.pth
 *.bin
 *.safetensors
+*.gguf
 checkpoints/
 
 # Data files
@@ -40,3 +41,6 @@ data/*.bin
 *.log
 wandb/
 runs/
+
+# Cache directories
+.cache/

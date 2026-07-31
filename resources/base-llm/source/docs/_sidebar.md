@@ -1,0 +1,78 @@
+- **第一部分：理论篇**
+    - **第 1 章：NLP 简介**
+        - [NLP 概述](chapter1/01_nlp_intro.md)
+        - [环境准备](chapter1/02_preparation.md)
+    - **第 2 章：文本表示与词向量**
+        - [初级分词技术](chapter2/03_tokenization.md)
+        - [词向量表示](chapter2/04_word_vector.md)
+        - [从主题模型到 Word2Vec](chapter2/05_Word2Vec.md)
+        - [基于 Gensim 的词向量实战](chapter2/06_gensim.md)
+    - **第 3 章：循环神经网络**
+        - [循环神经网络](chapter3/08_RNN.md)
+        - [LSTM 与 GRU](chapter3/09_LSTM&GRU.md)
+    - **第 4 章：注意力机制与 Transformer**
+        - [Seq2Seq 架构](chapter4/10_seq2seq.md)
+        - [注意力机制](chapter4/11_attention.md)
+        - [深入解析 Transformer](chapter4/12_transformer.md)
+    - **第 5 章：预训练模型**
+        - [BERT 结构及应用](chapter5/13_Bert.md)
+        - [GPT 结构及应用](chapter5/14_GPT.md)
+        - [T5 结构及应用](chapter5/15_T5.md)
+        - [Hugging Face 生态与核心库](chapter5/16_HuggingFace.md)
+    - **第 6 章：深入大模型架构**
+        - [手搓一个大模型](chapter6/17_handcraft_llama2.md)
+        - [MoE 架构解析](chapter6/18_MoE.md)
+        - [手撕大模型生成策略](chapter6/19_text_generation.md)
+        - [上下文学习与提示词技术](chapter6/20_in_context_learning.md)
+
+- **第二部分：实战篇**
+    - **第 1 章：文本分类**
+        - [文本分类简单实现](chapter7/01_text_classification.md)
+        - [基于 LSTM 的文本分类](chapter7/02_lstm_text_classification.md)
+        - [微调 BERT 模型进行文本分类](chapter7/03_bert_text_classification.md)
+    - **第 2 章：命名实体识别**
+        - [命名实体识别概要](chapter8/01_named_entity_recognition.md)
+        - [NER 项目的数据处理](chapter8/02_data_processing.md)
+        - [模型构建、训练与推理](chapter8/03_model_building_and_training.md)
+        - [模型的推理与优化](chapter8/04_evaluation_and_prediction.md)
+
+- **第三部分：微调量化篇**
+    - **第 1 章：参数高效微调**
+        - [PEFT 技术综述](chapter11/01_PEFT.md)
+        - [LoRA 方法详解](chapter11/02_lora.md)
+        - [基于 peft 库的 LoRA 实战](chapter11/03_peft_lora.md)
+        - [Qwen2.5 微调私有数据](chapter11/04_qwen2.5_qlora.md)
+    - **第 2 章：高级微调技术**
+        - [RLHF 技术详解](chapter12/01_RLHF.md)
+        - [LLaMA-Factory RLHF（DPO）实战](chapter12/02_llama_factory.md)
+    - **第 3 章：大模型训练与量化**
+        - [模型量化实战](chapter13/01_quantization.md)
+        - [Deepspeed 框架介绍](chapter13/02_deepspeed.md)
+
+- **第四部分：应用部署篇**
+    - **第 1 章：模型服务部署**
+        - [FastAPI 模型部署实战](chapter14/01_fastapi.md)
+        - [云服务器模型部署实战](chapter14/02_uv_linux.md)
+        - [使用 Docker Compose 部署模型服务](chapter14/03_docker_deploy.md)
+    - **第 2 章：自动化与性能优化**
+        - [Git 与 GitHub 版本控制基础](chapter15/01_Git.md)
+        - [搭建 Jenkins CI/CD 自动化部署流水线](chapter15/02_Jenkins.md)
+
+
+- **第五部分：大模型安全**
+    - **第 1 章：安全全景与威胁建模**
+        - [大模型安全总览](chapter16/01_LLM_safety_overview.md)
+        - [威胁建模及风险分析](chapter16/02_threat_modeling_analysis.md)
+    - **第 2 章：安全工程：对齐与架构设计**
+
+- **第六部分：多模态前沿**
+    - **第 1 章：认识多模态边界**
+        - [多模态全景概述](chapter19/01_multimodal_definition.md)
+        - [图文多模态](chapter19/02_ViT_CLIP.md)
+    - **第 2 章：视觉问答**
+        - [BLIP-2 与 LLaVA](chapter20/01_blip2_llava.md)
+        - [原生统一架构](chapter20/02_native_unified.md)
+        - [从 0 训练简化版 Omni 模型](chapter20/03_simplified_omni.md)
+
+- **Extra-chapter 精选**
+

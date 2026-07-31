@@ -1,0 +1,12 @@
+vocab_size: 6400
+special_tokens_scheme: minimind2_chatml
+
+hidden_size: 512
+num_layers: 8
+num_heads: 8
+num_kv_heads: 2
+rope_theta: 1000000.0
+dropout: 0.0
+
+image_feat_dim: 768
+image_tokens: 49

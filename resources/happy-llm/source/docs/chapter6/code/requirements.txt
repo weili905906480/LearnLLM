@@ -5,3 +5,5 @@ torchdata==0.9.0
 deepspeed
 pandas
 swanlab
+fastapi
+uvicorn

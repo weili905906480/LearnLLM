@@ -1,0 +1,28 @@
+config: configs/stages/sft_text.yaml
+vision_model: google/siglip2-base-patch16-224
+
+out_dir: checkpoints/seeker-omni-zh-m2chatml-tok6400/e2e_imgcap_stable
+vision_out_dir: checkpoints/seeker-omni-zh-m2chatml-tok6400/e2e_imgcap_stable/vision
+
+# 数据过滤
+id_contains: flickr8k
+max_samples: 8000
+
+train:
+  batch_size: 1
+  grad_accum: 8
+  max_steps: 3000
+  warmup_steps: 200
+  save_every: 500
+  log_every: 50
+
+  lr: 1.0e-5
+  lr_bridge: 2.0e-5
+  lr_vision: 1.0e-6
+
+vision:
+  vision_train_last_n: 2
+  distill_weight: 0.1
+
+tb:
+  enable: true
