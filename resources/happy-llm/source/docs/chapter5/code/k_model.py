@@ -362,15 +362,37 @@ class Transformer(PreTrainedModel):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def _prepare_attention_mask(self, attention_mask: Optional[torch.Tensor], tokens: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        把各种格式的 attention_mask 统一规范成模型内部需要的标准格式：
+            - 形状：2D (bsz, seq_len)
+            - 类型：bool（True=真实 token，False=padding）
+            - 设备：与 tokens 一致
+        如果传入 None 则原样返回 None（后续 Attention 会走纯因果注意力分支）。
+
+        参数：
+            attention_mask: 可能为 None，或 2D/3D/4D，或 int/float/bool 类型的 mask
+            tokens:         input_ids，形状 (bsz, seq_len)，用作设备与形状的参照物
+
+        返回：
+            规范化后的 (bsz, seq_len) bool 张量，或 None
+        """
+        # 无 mask 直接返回 None，不做处理
         if attention_mask is None:
             return None
+        # 降维：把 HF 风格的高维 mask 压成 2D
+        #   4D (bsz, 1, 1, seq_len) -> 取 [:,0,0,:] -> (bsz, seq_len)
+        #   3D (bsz, 1, seq_len)    -> 取 [:,0,:]   -> (bsz, seq_len)
         if attention_mask.dim() == 4:
             attention_mask = attention_mask[:, 0, 0, :]
         elif attention_mask.dim() == 3:
             attention_mask = attention_mask[:, 0, :]
+        # 对齐设备，否则后面跨设备做 & / masked_fill 会报错
         attention_mask = attention_mask.to(tokens.device)
+        # 统一 dtype 为 bool：非零 -> True(真实)，0 -> False(padding)
+        # 例：[[1,1,0]] (long)  ->  [[True,True,False]] (bool)
         if attention_mask.dtype != torch.bool:
             attention_mask = attention_mask > 0
+        # 形状校验：必须和 input_ids 完全一致，都是 (bsz, seq_len)，否则尽早暴露错误
         if attention_mask.shape != tokens.shape:
             raise ValueError(f"attention_mask shape {attention_mask.shape} must match input_ids shape {tokens.shape}")
         return attention_mask
@@ -381,79 +403,135 @@ class Transformer(PreTrainedModel):
             attention_mask: Optional[torch.Tensor],
             pad_token_id: int
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        把带 padding 的 batch 重新整理成「左填充」的紧凑格式：
+            - 真实 token 右对齐（内容贴着末尾），padding 全部在左边
+            - 去掉每条序列尾部的 padding，压缩到最长的「有效长度」
+        用于生成（generate/generate_super）前的预处理：自回归要基于末尾预测下一个 token，
+        左填充能保证末位一定是真实 token，而不是 padding。
+
+        参数：
+            idx:            (bsz, seq_len) 的 token 张量
+            attention_mask: (bsz, seq_len) 的 bool 张量，True=真实 / False=padding
+            pad_token_id:   填充符 id
+
+        返回：
+            (packed_idx, packed_mask)：均为 (bsz, max_len)，max_len 为最长的有效长度
+        """
+        # 无 mask 或 全部是真实 token（无 padding）时无需处理，直接返回
         if attention_mask is None or attention_mask.all():
             return idx, attention_mask
 
+        # 每条序列的真实长度：True=1/False=0，按序列维求和
+        # 例：mask = [[T,T,T,F,F],[T,F,F,F,F]] -> lengths = [3, 1]
         bsz = idx.size(0)
         lengths = attention_mask.long().sum(dim=1)
-        max_len = max(int(lengths.max().item()), 1)
+        # 目标长度 = 最长的有效长度（去掉 padding 后的紧凑长度），至少为 1
+        max_len = max(int(lengths.max().item()), 1)   # 例：max(3,1) = 3
+        # 先全填 padding：packed_idx 全 pad_token_id，packed_mask 全 False
         packed_idx = idx.new_full((bsz, max_len), pad_token_id)
         packed_mask = attention_mask.new_zeros((bsz, max_len), dtype=torch.bool)
 
         for row in range(bsz):
             valid_len = int(lengths[row].item())
+            # 整条都是 padding 的样本，跳过（保持全 pad、全 False）
             if valid_len <= 0:
                 continue
+            # 布尔索引：取出该行所有 True 位置的真实 token，按原顺序，顺便去掉 padding
+            # 例：idx[0] = [a,b,c,PAD,PAD], mask[0]=[T,T,T,F,F] -> valid_tokens=[a,b,c]
             valid_tokens = idx[row][attention_mask[row]]
+            # 左填充：真实 token 放到该行「最右端」，左边 max_len-valid_len 个位置保持 pad
+            # 例：max_len=3, valid_len=3 -> 占据 [0,1,2]（无左填充）
+            #     max_len=3, valid_len=1 -> 占据 [2]，索引 0,1 保持 pad
             packed_idx[row, max_len - valid_len:] = valid_tokens
+            # 同步把对应位置在 mask 里标记为 True（真实），左边保持 False（padding）
             packed_mask[row, max_len - valid_len:] = True
 
+        # 例（整体效果）：
+        # 输入 idx = [[a,b,c,PAD,PAD],[d,PAD,PAD,PAD,PAD]]
+        #     mask= [[T,T,T,F,F],[T,F,F,F,F]]，pad_token_id=0
+        # 输出 packed_idx  = [[a,b,c],[0,0,d]]
+        #      packed_mask = [[T,T,T],[F,F,T]]
         return packed_idx, packed_mask
     
     def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         """
-        - tokens: Optional[torch.Tensor], 输入 token 张量。
-        - targets: Optional[torch.Tensor], 目标 token 张量。
-        - kv_cache: bool, 是否使用键值缓存。
-        - kwargs: 其他关键字参数。
+        模型前向传播。支持训练（给 targets 算 loss）和推理（只取末位 logits）两种模式。
 
-        - self.OUT: CausalLMOutputWithPast, 包含 logits 和损失。
+        参数：
+            - tokens:  Optional[torch.Tensor], 输入 token 张量，形状 (bsz, seq_len)
+            - targets: Optional[torch.Tensor], 目标 token 张量（训练标签），形状同 tokens
+            - kwargs:  其他关键字参数，可能包含 input_ids / labels / attention_mask
+
+        返回：
+            - self.OUT: CausalLMOutputWithPast，含 logits 和 last_loss 两个字段
+
+        矩阵变化总览（训练分支，bsz=2, seq_len=3, dim=768, vocab=6144）：
+            tokens  (2, 3)     --tok_embeddings-->  h  (2, 3, 768)
+            h 经过 12 个 DecoderLayer 后形状不变     (2, 3, 768)
+            h 经 self.norm 后仍为                      (2, 3, 768)
+            logits = self.output(h)                ->  (2, 3, 6144)
         """
 
+        # 兼容 HF 调用：若通过 input_ids / labels 传入，则覆盖位置参数
         if 'input_ids' in kwargs:
             tokens = kwargs['input_ids']
         if 'labels' in kwargs:
             targets = kwargs['labels']
+        # 规范化 attention_mask -> (bsz, seq_len) bool 或 None
         attention_mask = self._prepare_attention_mask(kwargs.get('attention_mask'), tokens)
 
         # 前向传播函数
-        _bsz, seqlen = tokens.shape
-        # 通过词嵌入层和Dropout层
+        _bsz, seqlen = tokens.shape          # 例：(2, 3)
+        # 通过词嵌入层和 Dropout 层
+        # tokens (2,3) -> h (2,3,768)：每个 token id 映射成 dim 维向量
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
-        # 获取相对位置嵌入的频率
-        freqs_cos = self.freqs_cos[:seqlen]
+        # 获取相对位置嵌入（RoPE）的频率，只取当前序列长度对应的前 seqlen 行
+        # 预计算时长度是 max_seq_len，这里截到实际 seqlen 以匹配当前序列
+        freqs_cos = self.freqs_cos[:seqlen]   # (seqlen, head_dim//2)
         freqs_sin = self.freqs_sin[:seqlen]
 
-        # 通过Decoder层
+        # 依次通过每个 DecoderLayer（自注意力 + FFN + 残差），形状始终 (bsz, seq_len, dim)
         for layer in self.layers:
             h = layer(h, freqs_cos, freqs_sin, attention_mask=attention_mask)
-        # 通过归一化层
-        h = self.norm(h)
+        # 最后一层 RMSNorm
+        h = self.norm(h)                      # (2, 3, 768)
 
         if targets is not None:
-            # 如果给定了目标，计算损失
-            logits = self.output(h)
+            # ===== 训练分支：计算损失 =====
+            # 所有位置都映射到词表，得到完整 logits
+            logits = self.output(h)           # (2, 3, 6144)
+            # 确定忽略的 target 索引（padding 位置不算 loss）
             ignore_index = self.args.pad_token_id if self.args.pad_token_id is not None else 0
+            # 若 target 里有 -100（HF 约定），也一并忽略
             if torch.any(targets == -100):
                 ignore_index = -100
+            # 交叉熵：把 logits 和 targets 展平成 (bsz*seq_len, vocab) / (bsz*seq_len)
+            # reduction='none' 返回逐位置的 loss（不取平均），保存在 self.last_loss
             self.last_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
+                logits.view(-1, logits.size(-1)),   # (6, 6144)
+                targets.view(-1),                   # (6,)
                 ignore_index=ignore_index,
                 reduction='none'
             )
         else:
-            # 推理时的小优化：只对最后一个位置的输出进行前向传播
+            # ===== 推理分支：只取「最后一个有效位置」的 logits =====
             if attention_mask is None:
+                # 没有 mask：直接取每条序列最后一个位置的 hidden，再映射到词表
+                # h[:, [-1], :] -> (bsz, 1, dim) -> logits (bsz, 1, vocab)
                 logits = self.output(h[:, [-1], :])
             else:
-                full_logits = self.output(h)
-                last_token_pos = attention_mask.long().sum(dim=1).clamp(min=1) - 1
+                # 有 mask：先把所有位置都映射成 logits，再挑出每条序列最后一个「真实」token 的位置
+                # （左填充下，真实 token 右对齐，最后一个 True 的位置就是真实内容的末尾）
+                full_logits = self.output(h)        # (bsz, seq_len, vocab)
+                # 每条序列的有效长度（True 的个数），clamp(min=1) 防止全 pad 时下标变 -1
+                last_token_pos = attention_mask.long().sum(dim=1).clamp(min=1) - 1   # (bsz,)
+                # 按 (行, 末位位置) 取出对应 logits，再 unsqueeze 回 (bsz, 1, vocab)
                 logits = full_logits[torch.arange(_bsz, device=tokens.device), last_token_pos].unsqueeze(1)
             self.last_loss = None
 
-        # 设置输出
+        # 把结果装进 CausalLMOutputWithPast 并返回
         self.OUT.__setitem__('logits', logits)
         self.OUT.__setitem__('last_loss', self.last_loss)
         return self.OUT
@@ -471,57 +549,95 @@ class Transformer(PreTrainedModel):
             pad_token_id: Optional[int] = None
     ):
         """
-        给定输入序列 idx（形状为 (bz,seq_len) 的长整型张量），通过多次生成新 token 来完成序列。
-        在 model.eval() 模式下运行。效率较低的采样版本，没有使用键k/v cache。
+        给定输入序列 idx（形状为 (bsz, seq_len) 的长整型张量），通过多次生成新 token 来完成序列。
+        在 model.eval() 模式下运行。效率较低的采样版本，没有使用键 k/v cache。
+
+        参数：
+            idx:             (bsz, seq_len) 的 prompt token 张量，如 [[a,b,c,PAD],[d,e,PAD,PAD]]
+            stop_id:         停止符 token id，生成到它就结束该条序列
+            max_new_tokens:  最多生成多少个新 token（默认 256）
+            temperature:     采样温度；0.0 走贪婪解码，否则按温度缩放后采样
+            top_k:           只从概率最高的 k 个 token 里采样；None 表示不限制
+            attention_mask:  (bsz, seq_len) 或 3D/4D，标记真实 token(True) 与 padding(False)
+            pad_token_id:    填充符 id
+
+        返回：
+            (bsz, num_generated) 的只含「新生成部分」的 token 张量。
         """
+        # 兜底确定填充符 id
         if pad_token_id is None:
             pad_token_id = self.args.pad_token_id if self.args.pad_token_id is not None else 0
+        # 1) 规范化 attention_mask：None/3D/4D/int 都统一成 (bsz, seq_len) 的 bool 张量
         attention_mask = self._prepare_attention_mask(attention_mask, idx)
+        # 2) 左填充：真实内容右对齐、pad 在左，并压缩掉尾部 padding
+        #    idx:  [[a,b,c,PAD],[d,e,PAD,PAD]]  ->  [[a,b,c],[PAD,d,e]]
+        #    mask: [[T,T,T,F],[T,T,F,F]]        ->  [[T,T,T],[F,T,T]]
         idx, attention_mask = self._left_pad_by_attention_mask(idx, attention_mask, pad_token_id)
 
-        finished = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
-        index = idx.shape[1]
+        # finished: (bsz,) 的 bool，标记每条序列是否已结束，初始全 False
+        finished = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)   # [False, False]
+        # index 记录 prompt 长度（左填充后的 seq_len），最后用它切片只返回生成部分
+        index = idx.shape[1]                                                        # 3
+
+        # 主循环：每次迭代生成一个新 token
         for _ in range(max_new_tokens):
-            # 如果序列上下文过长，截断它到最大长度
+            # ---- 4a. 上下文超长则截断，只保留最后 max_seq_len 个 token ----
             idx_cond = idx if idx.size(1) <= self.args.max_seq_len else idx[:, -self.args.max_seq_len:]
             mask_cond = None
             if attention_mask is not None:
                 mask_cond = attention_mask if attention_mask.size(1) <= self.args.max_seq_len else attention_mask[:, -self.args.max_seq_len:]
-            
-            # 前向传播获取序列中最后一个位置的 logits
+
+            # ---- 4b. 前向传播，只取最后一个位置的 logits ----
+            # self(...) 输出 (bsz, seq_len, vocab_size)；[:, -1, :] 取末位 -> (bsz, vocab_size)
+            # 左填充保证末位一定是真实 token，自回归只需预测「下一个」
             logits = self(idx_cond, attention_mask=mask_cond).logits
             logits = logits[:, -1, :] # 只保留最后一个时间步的输出
-            
+
+            # ---- 4c. 根据 temperature/top_k 选择下一个 token ----
             if temperature == 0.0:
-                # 选择最有可能的索引
+                # 分支 A：贪婪解码，直接取每行最大 logits 的索引（argmax）
+                # logits: [[2.0,0.5,0.1,1.0,0.3],
+                #          [1.0,2.5,0.8,0.2,0.1]]  ->  idx_next: [[0],[1]]
                 _, idx_next = torch.topk(logits, k=1, dim=-1)
             else:
+                # 分支 B：温度采样
                 # 缩放 logits 并应用 softmax
-                logits = logits / temperature
+                logits = logits / temperature        # 温度>1 更平滑(随机)，<1 更尖锐(确定)
                 if top_k is not None:
+                    # top-k：把低于第 k 大的 logits 置为 -inf，softmax 后概率为 0
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float('Inf')
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
+                probs = F.softmax(logits, dim=-1)    # (bsz, vocab_size) 概率分布
+                idx_next = torch.multinomial(probs, num_samples=1)   # 按概率采样 1 个 -> (bsz, 1)
 
-            prev_finished = finished.clone()
+            # ---- 4d. 更新结束状态 ----
+            prev_finished = finished.clone()         # 保存本轮之前的结束状态
             if stop_id is not None:
                 if prev_finished.any():
+                    # 已结束的序列不再生成新 token，用 fill_token 占位保持形状整齐
                     fill_token = pad_token_id if pad_token_id is not None else stop_id
                     idx_next = torch.where(prev_finished[:, None], torch.full_like(idx_next, fill_token), idx_next)
+                # 之前结束过 或 本轮生成 stop_id -> 该序列标记为结束
                 finished = prev_finished | idx_next[:, 0].eq(stop_id)
 
-            # 将采样的索引添加到序列中并继续
+            # ---- 4e. 将新 token 拼接到序列末尾，并同步扩展 mask ----
+            # idx: [[a,b,c],[PAD,d,e]] -> [[a,b,c,3],[PAD,d,e,1]]
             idx = torch.cat((idx, idx_next), dim=1)
             if attention_mask is not None:
                 next_mask = torch.ones((attention_mask.size(0), 1), dtype=attention_mask.dtype, device=attention_mask.device)
                 if prev_finished.any():
+                    # 上轮已结束的序列，本轮生成的是占位 pad，mask 记为 False
                     next_mask[prev_finished] = False
+                # mask: [[T,T,T],[F,T,T]] -> [[T,T,T,T],[F,T,T,T]]
                 attention_mask = torch.cat((attention_mask, next_mask), dim=1)
 
+            # ---- 4f. 所有序列都结束则提前退出循环 ----
             if stop_id is not None and finished.all():
                 break
 
+        # 用 index 切片，只返回新生成的 token
+        # 例：最终 idx = [[a,b,c,3,2,<eos>],[PAD,d,e,1,4,<eos>]]，index=3
+        #     返回 idx[:,3:] = [[3,2,<eos>],[1,4,<eos>]]，形状 (bsz, num_generated)
         return idx[:, index:] # 只返回生成的token
     
     def _greedy_decode(self, logits: torch.Tensor) -> torch.Tensor:
